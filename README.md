@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/DanimanX/DriveSync/actions/workflows/ci.yml/badge.svg)](https://github.com/DanimanX/DriveSync/actions/workflows/ci.yml)
 
-Versión 0.1.2 · CLI en Rust para sincronizar archivos y carpetas con Google Drive usando un
+Versión 0.2.0 · CLI en Rust para sincronizar archivos y carpetas con Google Drive usando un
 token de Google. Sin SDKs pesados: habla directamente con la API v3 de Drive
 sobre HTTPS, guarda el estado de la sincronización y resuelve conflictos sin
 perder ninguna versión.
@@ -42,7 +42,7 @@ Cada tag publica una release con los binarios de `x86_64` y `aarch64` en
 <https://github.com/DanimanX/DriveSync/releases>.
 
 ```bash
-tag=v0.1.2
+tag=v0.2.0
 arch=x86_64-unknown-linux-gnu        # o aarch64-unknown-linux-gnu
 base="https://github.com/DanimanX/DriveSync/releases/download/$tag"
 
@@ -123,16 +123,23 @@ drivesync auth --manual --client-id ID --client-secret SECRET
 ```
 
 ```
-1. Abre esta URL en cualquier navegador (puede ser otro equipo):
+1. Abre esta URL en el navegador:
 
    https://accounts.google.com/o/oauth2/v2/auth?client_id=...&redirect_uri=...
 
-2. Autoriza la aplicación. El navegador intentará ir a http://127.0.0.1:8765/callback
-   y mostrará un error de conexión: es lo esperado.
-3. Copia la URL completa de la barra de direcciones (contiene code=...) o pega un token de acceso.
+2. Autoriza la aplicación. DriveSync escucha en http://127.0.0.1:8765/callback
+   y te mostrará el código en una página, listo para copiar.
+3. Si el navegador está en otra máquina y no llega a la página, copia la URL
+   completa de la barra de direcciones (contiene code=...).
 
 Pega la URL, el código o el token:
 ```
+
+Si el navegador corre en la misma máquina, al autorizar verás una página con el
+código en grande, botón **Copiar código** y, plegada, la URL completa por si
+prefieres pegarla. El CLI recibe el código automáticamente desde esa página, así
+que normalmente no hay que pegar nada; el prompt queda para cuando el navegador
+está en otro equipo (o el puerto está ocupado y no se puede servir la página).
 
 Qué acepta el prompt:
 

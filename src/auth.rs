@@ -4,6 +4,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -15,6 +16,7 @@ use crate::config::{save_config, Config};
 use crate::util;
 
 const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+const MANUAL_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
@@ -377,35 +379,118 @@ pub struct ManualOptions {
 
 /// Flujo OAuth sin servidor local: se muestra la URL y se pide el resultado
 /// por teclado. Sirve en máquinas sin navegador o por SSH.
+/// De dónde llegó el código: del navegador (página local) o pegado a mano.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Browser,
+    Stdin,
+}
+
+/// Eventos que pueden desbloquear la espera.
+enum Event {
+    Input(Source, String),
+    /// La entrada estándar se cerró sin datos.
+    StdinClosed,
+}
+
 pub fn run_manual(options: &ManualOptions) -> Result<Config> {
     let state = options
         .state
         .clone()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(util::unique_id);
-    let auth_url = authorization_url(
-        &options.client_id,
-        &options.redirect_uri,
-        &options.scope,
-        &state,
-    );
 
-    println!("1. Abre esta URL en cualquier navegador (puede ser otro equipo):\n");
+    // Se intenta escuchar en la URI de redirección para poder servir una página
+    // con el código. Si el puerto está ocupado, el flujo sigue siendo manual.
+    let (host, requested_port, path) = parse_redirect_uri(&options.redirect_uri)
+        .context("redirect_uri inválida: se espera http://127.0.0.1:<puerto>/callback")?;
+    let listener = TcpListener::bind((host.as_str(), requested_port)).ok();
+    let port = match &listener {
+        Some(listener) => listener
+            .local_addr()
+            .map(|addr| addr.port())
+            .unwrap_or(requested_port),
+        None => requested_port,
+    };
+    let redirect_uri = format!("http://{host}:{port}{path}");
+    let auth_url = authorization_url(&options.client_id, &redirect_uri, &options.scope, &state);
+
+    println!("1. Abre esta URL en el navegador:\n");
     println!("   {auth_url}\n");
+    match &listener {
+        Some(_) => println!(
+            "2. Autoriza la aplicación. DriveSync escucha en {redirect_uri}\n   y te mostrará el código en una página, listo para copiar."
+        ),
+        None => println!(
+            "2. Autoriza la aplicación. El navegador intentará ir a {redirect_uri}\n   y mostrará un error de conexión: eso es esperado."
+        ),
+    }
     println!(
-        "2. Autoriza la aplicación. El navegador intentará ir a {}\n   y mostrará un error de conexión: es lo esperado.",
-        options.redirect_uri
+        "3. Si el navegador está en otra máquina y no llega a la página, copia la URL\n   completa de la barra de direcciones (contiene code=...).\n"
     );
-    println!(
-        "3. Copia la URL COMPLETA de la barra de direcciones (empieza por http://127.0.0.1 y\n   contiene code=...), sin recortarla."
-    );
-    println!(
-        "   El navegador mostrará \"ERR_CONNECTION_REFUSED\": es correcto, no hay servidor\n   local escuchando en modo manual. Lo que importa es la URL, no la página.\n"
-    );
+    if listener.is_none() {
+        eprintln!(
+            "[aviso] el puerto {port} está ocupado: no habrá página local, pega la URL a mano."
+        );
+    }
+
+    let (tx, rx) = mpsc::channel::<Event>();
+    let has_page = listener.is_some();
+
+    if let Some(listener) = listener {
+        let tx = tx.clone();
+        let expected = state.clone();
+        let redirect = redirect_uri.clone();
+        std::thread::spawn(move || {
+            serve_code_page(listener, expected, redirect, tx);
+        });
+    }
+
+    {
+        let tx = tx.clone();
+        std::thread::spawn(move || loop {
+            match read_input_line() {
+                Ok(line) if !line.trim().is_empty() => {
+                    let _ = tx.send(Event::Input(Source::Stdin, line.trim().to_string()));
+                    break;
+                }
+                Ok(_) => continue,
+                Err(_) => {
+                    let _ = tx.send(Event::StdinClosed);
+                    break;
+                }
+            }
+        });
+    }
+    drop(tx);
 
     print!("Pega la URL, el código o el token: ");
     std::io::stdout().flush().ok();
-    let raw = read_input_line()?;
+
+    let deadline = Instant::now() + MANUAL_TIMEOUT;
+    let (source, raw) = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!(
+                "tiempo de espera agotado ({} minutos) sin recibir la autorización",
+                MANUAL_TIMEOUT.as_secs() / 60
+            );
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(Event::Input(source, raw)) => break (source, raw),
+            // Sin entrada por teclado y sin página posible no hay nada que esperar.
+            Ok(Event::StdinClosed) if !has_page => bail!(
+                "la entrada estándar se cerró sin datos; vuelve a ejecutar \
+                 `drivesync auth --manual` y pega la URL o el código"
+            ),
+            Ok(Event::StdinClosed) => continue,
+            Err(_) => bail!(
+                "tiempo de espera agotado ({} minutos) sin recibir la autorización",
+                MANUAL_TIMEOUT.as_secs() / 60
+            ),
+        }
+    };
+
     let parsed = parse_manual_input(&raw)?;
 
     match &parsed.state {
@@ -415,9 +500,13 @@ pub fn run_manual(options: &ManualOptions) -> Result<Config> {
              la respuesta no corresponde a esta sesión"
         ),
         None => eprintln!(
-            "[aviso] no se pudo comprobar el parámetro state; asegúrate de haber pegado \
-             una URL de esta misma ejecución"
+            "[aviso] no se pudo comprobar el parámetro state; asegúrate de que la respuesta \
+             viene de esta misma ejecución"
         ),
+    }
+
+    if source == Source::Browser {
+        println!("\nCódigo recibido desde el navegador; no hace falta pegarlo.");
     }
 
     match parsed.grant {
@@ -438,10 +527,270 @@ pub fn run_manual(options: &ManualOptions) -> Result<Config> {
             &options.client_id,
             &options.client_secret,
             &code,
-            &options.redirect_uri,
+            &redirect_uri,
             &options.scope,
         ),
     }
+}
+
+/// Atiende peticiones hasta recibir un `code` válido, mostrando la página.
+fn serve_code_page(
+    listener: TcpListener,
+    expected_state: String,
+    redirect_uri: String,
+    tx: mpsc::Sender<Event>,
+) {
+    for stream in listener.incoming().flatten() {
+        let mut stream = stream;
+        let target = match read_request_target(&mut stream) {
+            Some(target) => target,
+            None => continue,
+        };
+        let (path, query) = split_target(&target);
+        let params = parse_query(query);
+
+        if path != "/callback" && path != "/" {
+            let _ = write_html(
+                &mut stream,
+                404,
+                "DriveSync",
+                &simple_page(
+                    "Ruta desconocida",
+                    "Vuelve a la terminal y abre la URL de autorización que se imprimió.",
+                ),
+            );
+            continue;
+        }
+
+        if let Some(error) = params.get("error") {
+            let detail = params
+                .get("error_description")
+                .cloned()
+                .unwrap_or_else(|| error.clone());
+            let _ = write_html(
+                &mut stream,
+                400,
+                "DriveSync · error",
+                &simple_page("Google rechazó la autorización", &detail),
+            );
+            let _ = tx.send(Event::Input(
+                Source::Browser,
+                format!("{redirect_uri}?error={error}"),
+            ));
+            break;
+        }
+
+        let Some(code) = params.get("code").filter(|code| !code.is_empty()) else {
+            let _ = write_html(
+                &mut stream,
+                400,
+                "DriveSync · falta el código",
+                &simple_page(
+                    "Falta el parámetro code",
+                    "La URL no traía code=... Copia la URL completa de la barra de direcciones.",
+                ),
+            );
+            continue;
+        };
+
+        if params.get("state").map(String::as_str) != Some(expected_state.as_str()) {
+            let _ = write_html(
+                &mut stream,
+                400,
+                "DriveSync · state inválido",
+                &simple_page(
+                    "Sesión no válida",
+                    "El parámetro state no coincide con esta ejecución. Vuelve a la terminal \
+                     y abre la URL que imprimió el comando actual.",
+                ),
+            );
+            continue;
+        }
+
+        let full_url = format!("{redirect_uri}?{}", query);
+        let _ = write_html(
+            &mut stream,
+            200,
+            "DriveSync · código",
+            &code_page(code, &full_url),
+        );
+        let _ = tx.send(Event::Input(Source::Browser, full_url));
+        break;
+    }
+}
+
+/// Página con el código de autorización, listo para copiar.
+fn code_page(code: &str, full_url: &str) -> String {
+    const PAGE: &str = r#"<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DriveSync · pega este código en el CLI</title>
+<style>
+  :root { color-scheme: light dark; --bg:#0f1115; --card:#171a21; --fg:#e8eaed;
+          --muted:#9aa3b2; --accent:#7bd88f; --line:#2a2f3a; }
+  * { box-sizing: border-box; }
+  body { margin:0; min-height:100vh; display:grid; place-items:center;
+         background:var(--bg); color:var(--fg);
+         font:16px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; padding:24px; }
+  main { width:min(680px,100%); background:var(--card); border:1px solid var(--line);
+         border-radius:16px; padding:32px; box-shadow:0 18px 50px rgba(0,0,0,.35); }
+  h1 { font-size:1.35rem; margin:0 0 6px; }
+  .lead { margin:0 0 22px; color:var(--muted); }
+  .badge { display:inline-flex; align-items:center; gap:8px; font-size:.8rem;
+           color:var(--accent); border:1px solid var(--accent); border-radius:999px;
+           padding:4px 10px; margin-bottom:18px; }
+  .code { font:600 clamp(1rem,2.6vw,1.4rem)/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;
+          background:#0b0d11; border:1px solid var(--line); border-radius:12px;
+          padding:18px; word-break:break-all; user-select:all; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; margin-top:16px; }
+  button { font:inherit; font-weight:600; cursor:pointer; border-radius:10px;
+           border:1px solid var(--line); background:#222836; color:var(--fg);
+           padding:10px 16px; transition:.15s; }
+  button:hover { background:#2b3242; }
+  button.primary { background:var(--accent); color:#08240f; border-color:transparent; }
+  button.primary:hover { filter:brightness(1.06); }
+  details { margin-top:22px; color:var(--muted); }
+  summary { cursor:pointer; }
+  .url { font:0.82rem/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; margin-top:10px;
+         padding:12px; background:#0b0d11; border:1px solid var(--line); border-radius:10px;
+         word-break:break-all; user-select:all; }
+  .warn { margin-top:22px; font-size:.85rem; color:var(--muted);
+          border-top:1px solid var(--line); padding-top:16px; }
+  code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+</style>
+</head>
+<body>
+<main>
+  <span class="badge">Autorización completada</span>
+  <h1>Pega este código ahora en el CLI</h1>
+  <p class="lead">Es lo único que falta. Vuelve a la terminal donde corre <code>drivesync</code>.</p>
+
+  <div class="code" id="code">{{CODE}}</div>
+
+  <div class="row">
+    <button class="primary" id="copy">Copiar código</button>
+    <button id="select">Seleccionar</button>
+  </div>
+
+  <details>
+    <summary>¿No puedes pegarlo? Copia la URL completa</summary>
+    <div class="url" id="url">{{URL}}</div>
+    <div class="row"><button id="copy-url">Copiar URL</button></div>
+  </details>
+
+  <p class="warn">No compartas este código: permite obtener acceso a tu Drive durante unos
+  minutos. Caduca en ~10 minutos y solo sirve una vez.</p>
+</main>
+<script>
+  const code = document.getElementById('code').textContent.trim();
+  const url = document.getElementById('url').textContent.trim();
+  async function copy(text, button, label) {
+    try {
+      await navigator.clipboard.writeText(text);
+      button.textContent = '¡Copiado!';
+    } catch (error) {
+      const area = document.createElement('textarea');
+      area.value = text;
+      document.body.appendChild(area);
+      area.select();
+      document.execCommand('copy');
+      area.remove();
+      button.textContent = 'Copiado';
+    }
+    setTimeout(() => { button.textContent = label; }, 2000);
+  }
+  document.getElementById('copy').addEventListener('click', (event) =>
+    copy(code, event.currentTarget, 'Copiar código'));
+  document.getElementById('copy-url').addEventListener('click', (event) =>
+    copy(url, event.currentTarget, 'Copiar URL'));
+  document.getElementById('select').addEventListener('click', () => {
+    const range = document.createRange();
+    range.selectNodeContents(document.getElementById('code'));
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+  });
+</script>
+</body>
+</html>
+"#;
+    PAGE.replace("{{CODE}}", &escape_html(code))
+        .replace("{{URL}}", &escape_html(full_url))
+}
+
+fn simple_page(title: &str, message: &str) -> String {
+    format!(
+        "<!doctype html><html lang=\"es\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <title>{title}</title></head>\
+         <body style=\"font:16px/1.6 system-ui,sans-serif;margin:3rem auto;max-width:40rem;padding:0 1.2rem\">\
+         <h1 style=\"font-size:1.3rem\">{title}</h1><p>{message}</p></body></html>",
+        title = escape_html(title),
+        message = escape_html(message),
+    )
+}
+
+fn escape_html(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn write_html(stream: &mut TcpStream, status: u16, title: &str, body: &str) -> Result<()> {
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        _ => "OK",
+    };
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\n\
+         Content-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes())?;
+    stream.flush()?;
+    let _ = title;
+    Ok(())
+}
+
+fn read_request_target(stream: &mut TcpStream) -> Option<String> {
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    let mut buf = [0u8; 8192];
+    let read = stream.read(&mut buf).ok()?;
+    if read == 0 {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&buf[..read]);
+    let line = text.lines().next()?;
+    line.split_whitespace().nth(1).map(str::to_string)
+}
+
+/// `http://127.0.0.1:8765/callback` → (`127.0.0.1`, 8765, `/callback`).
+fn parse_redirect_uri(uri: &str) -> Option<(String, u16, String)> {
+    let rest = uri
+        .strip_prefix("http://")
+        .or_else(|| uri.strip_prefix("https://"))?;
+    let (authority, path) = match rest.find('/') {
+        Some(index) => (&rest[..index], &rest[index..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host.to_string(), port.parse().ok()?),
+        None => (authority.to_string(), 80),
+    };
+    Some((host, port, path.to_string()))
 }
 
 fn read_input_line() -> Result<String> {
@@ -552,6 +901,14 @@ fn split_target(target: &str) -> (&str, &str) {
     }
 }
 
+/// Decodifica una query estilo `application/x-www-form-urlencoded`, donde `+`
+/// significa espacio (es lo que usa Google en `error_description`).
+fn decode_param(value: &str) -> String {
+    percent_encoding::percent_decode_str(&value.replace('+', " "))
+        .decode_utf8_lossy()
+        .into_owned()
+}
+
 fn parse_query(query: &str) -> std::collections::HashMap<String, String> {
     let mut params = std::collections::HashMap::new();
     for pair in query.split('&') {
@@ -562,13 +919,7 @@ fn parse_query(query: &str) -> std::collections::HashMap<String, String> {
             Some((k, v)) => (k, v),
             None => (pair, ""),
         };
-        let key = percent_encoding::percent_decode_str(key)
-            .decode_utf8_lossy()
-            .into_owned();
-        let value = percent_encoding::percent_decode_str(value)
-            .decode_utf8_lossy()
-            .into_owned();
-        params.insert(key, value);
+        params.insert(decode_param(key), decode_param(value));
     }
     params
 }
@@ -677,6 +1028,16 @@ mod tests {
         let params = parse_query("code=4%2F0AbC&state=abc%20123&scope=a%20b");
         assert_eq!(params.get("code").map(String::as_str), Some("4/0AbC"));
         assert_eq!(params.get("state").map(String::as_str), Some("abc 123"));
+    }
+
+    #[test]
+    fn decodifica_mas_como_espacio() {
+        // Google manda así los error_description.
+        let params = parse_query("error=access_denied&error_description=El+usuario+rechaz%C3%B3");
+        assert_eq!(
+            params.get("error_description").map(String::as_str),
+            Some("El usuario rechazó")
+        );
     }
 
     #[test]

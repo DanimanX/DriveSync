@@ -1114,8 +1114,11 @@ fn auth_manual_canjea_la_url_pegada() {
         "--quiet",
     ];
 
-    // Sin entrada: muestra la URL y falla sin guardar nada.
-    let sin_entrada = run_cli_with_stdin(mock.base(), &config, &args, "");
+    // Sin entrada y sin página posible (puerto privilegiado): falla al instante
+    // y no guarda nada.
+    let mut sin_pagina = args.to_vec();
+    sin_pagina.extend_from_slice(&["--redirect-uri", "http://127.0.0.1:1/callback"]);
+    let sin_entrada = run_cli_with_stdin(mock.base(), &config, &sin_pagina, "");
     assert!(!sin_entrada.status.success());
     assert!(!config.exists(), "no debe guardar nada si no hay entrada");
     let out = stdout(&sin_entrada);
@@ -1128,7 +1131,7 @@ fn auth_manual_canjea_la_url_pegada() {
     let decoded = percent_decode_str(&out).decode_utf8_lossy().into_owned();
     assert!(decoded.contains("state=estado-fijo"), "{decoded}");
     assert!(
-        decoded.contains("redirect_uri=http://127.0.0.1:8765/callback"),
+        decoded.contains("redirect_uri=http://127.0.0.1:1/callback"),
         "{decoded}"
     );
 
@@ -1160,6 +1163,158 @@ fn auth_manual_canjea_la_url_pegada() {
     assert_eq!(saved["access_token"], "token-renovado");
     assert_eq!(saved["refresh_token"], "refresh-nuevo");
     assert_eq!(saved["client_id"], "cid");
+}
+
+/// Lanza el CLI, espera a que imprima la URL con el puerto, simula el navegador
+/// y devuelve (HTML servido, salida del proceso).
+fn run_manual_with_browser(
+    base: &str,
+    config: &Path,
+    state: &str,
+    queries: &[&str],
+) -> (Vec<String>, Output, String) {
+    use std::process::Stdio;
+    use std::sync::{Arc, Mutex};
+
+    let mut child = command_for(base, config, None)
+        .args([
+            "auth",
+            "--manual",
+            "--client-id",
+            "cid",
+            "--client-secret",
+            "sec",
+            "--port",
+            "0",
+            "--state",
+            state,
+            "--quiet",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("no se pudo ejecutar drivesync");
+
+    let stdout = child.stdout.take().expect("stdout");
+    let collected = Arc::new(Mutex::new(String::new()));
+    let sink = Arc::clone(&collected);
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        while reader.read_line(&mut line).unwrap_or(0) > 0 {
+            sink.lock().unwrap().push_str(&line);
+            line.clear();
+        }
+    });
+
+    // Espera a que aparezca la URL con el puerto real.
+    let mut port = None;
+    for _ in 0..100 {
+        let text = collected.lock().unwrap().clone();
+        if let Some(index) = text.find("127.0.0.1:") {
+            let rest = &text[index + "127.0.0.1:".len()..];
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(value) = digits.parse::<u16>() {
+                port = Some(value);
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let port = port.expect("el CLI nunca imprimió la URL con el puerto");
+
+    let mut responses = Vec::new();
+    for query in queries {
+        let mut connection = TcpStream::connect(("127.0.0.1", port)).expect("conectar al callback");
+        let request = format!(
+            "GET /callback?{query} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+        );
+        connection
+            .write_all(request.as_bytes())
+            .expect("enviar petición");
+        let mut response = String::new();
+        connection
+            .read_to_string(&mut response)
+            .expect("leer respuesta");
+        responses.push(response);
+    }
+
+    let output = child.wait_with_output().expect("esperar drivesync");
+    let text = collected.lock().unwrap().clone();
+    (responses, output, text)
+}
+
+#[test]
+fn auth_manual_sirve_pagina_con_el_codigo_y_lo_recibe() {
+    let mock = MockDrive::start();
+    let work = tempfile::tempdir().unwrap();
+    let config = config_path(work.path());
+
+    let (responses, output, texto) = run_manual_with_browser(
+        mock.base(),
+        &config,
+        "estado-pagina",
+        &["state=estado-pagina&code=4/0AUn6Hd_codigoDeLaPagina"],
+    );
+    assert_ok(&output);
+    let html = &responses[0];
+    assert!(html.starts_with("HTTP/1.1 200"), "{html}");
+
+    // La página muestra el código y el texto pedido.
+    assert!(
+        html.contains("Pega este código ahora en el CLI"),
+        "falta el título: {html}"
+    );
+    assert!(
+        html.contains("4/0AUn6Hd_codigoDeLaPagina"),
+        "falta el código en la página"
+    );
+    assert!(html.contains("Copiar código"), "falta el botón de copiar");
+
+    // Y el CLI lo recibió sin que se pegara nada: guardó los tokens.
+    let saved: Value = serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+    assert_eq!(saved["access_token"], "token-renovado");
+    assert_eq!(saved["refresh_token"], "refresh-nuevo");
+    assert!(
+        texto.contains("Código recibido desde el navegador"),
+        "el CLI debe avisar que recibió el código por la página: {texto}"
+    );
+}
+
+#[test]
+fn auth_manual_rechaza_el_state_ajeno_y_luego_acepta() {
+    let mock = MockDrive::start();
+    let work = tempfile::tempdir().unwrap();
+    let config = config_path(work.path());
+
+    let (responses, output, _texto) = run_manual_with_browser(
+        mock.base(),
+        &config,
+        "estado-bueno",
+        &[
+            // Primero una respuesta con state ajeno: debe rechazarse.
+            "state=ajeno&code=4/0malo",
+            // Después la buena: el CLI sigue esperando y ahora sí canjea.
+            "state=estado-bueno&code=4/0bueno",
+        ],
+    );
+    assert_ok(&output);
+    assert!(
+        responses[0].starts_with("HTTP/1.1 400"),
+        "el state ajeno debe rechazarse: {}",
+        responses[0]
+    );
+    assert!(
+        responses[0].contains("Sesión no válida"),
+        "{}",
+        responses[0]
+    );
+    assert!(responses[1].starts_with("HTTP/1.1 200"), "{}", responses[1]);
+    assert!(responses[1].contains("4/0bueno"));
+
+    let saved: Value = serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+    assert_eq!(saved["access_token"], "token-renovado");
 }
 
 #[test]
@@ -1205,6 +1360,10 @@ fn auth_manual_falla_sin_entrada() {
             "cid",
             "--client-secret",
             "sec",
+            // Puerto privilegiado: no se puede servir página, así que sin stdin
+            // el comando debe fallar en vez de esperar al navegador.
+            "--redirect-uri",
+            "http://127.0.0.1:1/callback",
             "--quiet",
         ],
         "",
