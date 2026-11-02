@@ -33,16 +33,31 @@ drivesync sync ./documentos --remote Backup/Documentos
 - Una cuenta de Google y un cliente OAuth de tipo **Aplicación de escritorio**
   (solo si quieres refresh token; con un token de acceso temporal no hace falta).
 
-## Compilar e instalar
+## Instalar
+
+### Binario precompilado (Linux)
+
+Cada tag publica una release con los binarios de `x86_64` y `aarch64` en
+<https://github.com/DanimanX/DriveSync/releases>.
+
+```bash
+tag=v0.0.1
+arch=x86_64-unknown-linux-gnu        # o aarch64-unknown-linux-gnu
+base="https://github.com/DanimanX/DriveSync/releases/download/$tag"
+
+curl -fsSLO "$base/drivesync-${tag#v}-$arch"
+curl -fsSLO "$base/SHA256SUMS-$arch.txt"
+sha256sum -c "SHA256SUMS-$arch.txt"
+
+install -m 755 "drivesync-${tag#v}-$arch" ~/.local/bin/drivesync
+drivesync --version
+```
+
+### Desde el código
 
 ```bash
 cargo build --release
 install -m 755 target/release/drivesync ~/.local/bin/drivesync
-```
-
-Comprueba la instalación:
-
-```bash
 drivesync --help
 ```
 
@@ -245,8 +260,22 @@ cargo test
 
 El flujo de GitHub Actions (`.github/workflows/ci.yml`) ejecuta formato, clippy,
 pruebas y compilación release para `x86_64` y `aarch64` en cada push a `main`,
-en cada pull request y en cada tag `v*`. Los binarios empaquetados quedan como
-artefactos de la ejecución.
+en cada pull request y en cada tag `v*`.
+
+Los binarios compilados se publican de dos formas:
+
+- **Artefactos del run** (`drivesync-<target>`): disponibles para inspección,
+  requieren sesión en GitHub y caducan a los 90 días.
+- **Release de GitHub**: al empujar un tag `v*` se crea la release con el
+  binario crudo, su `.tar.gz` y `SHA256SUMS-<target>.txt` de cada arquitectura.
+  Es la vía normal para descargar e instalar.
+
+Para publicar una release de un tag que ya existe sin volver a etiquetar, lanza
+el workflow a mano indicando el tag:
+
+```bash
+gh workflow run ci.yml -f release_tag=v0.0.1
+```
 
 La suite incluye:
 

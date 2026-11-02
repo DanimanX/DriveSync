@@ -7,6 +7,11 @@ on:
   pull_request:
     branches: ["main"]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Tag ya existente para publicar una release (ej. v0.0.1)"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -82,8 +87,8 @@ jobs:
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/drivesync" "dist/${name}"
           tar -C dist -czf "dist/${name}.tar.gz" "${name}"
-          (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
-          rm "dist/${name}"
+          (cd dist && sha256sum "${name}" "${name}.tar.gz" > "SHA256SUMS-${{ matrix.target }}.txt")
+          file "dist/${name}"
 
       - name: Publicar artefacto
         uses: actions/upload-artifact@v4
@@ -91,3 +96,65 @@ jobs:
           name: drivesync-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
+
+  publicar-release:
+    name: Publicar release con binarios
+    needs: compilar
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Descargar artefactos compilados
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verificar binarios
+        run: |
+          set -euo pipefail
+          ls -lh dist
+          for bin in dist/drivesync-*-*; do
+            case "$bin" in
+              *.tar.gz|*.txt) continue ;;
+            esac
+            file "$bin"
+            "$bin" --version
+          done
+
+      - name: Escribir notas de la release
+        run: |
+          cat > notas.md <<'FIN'
+          Binarios de drivesync para Linux (x86_64 y aarch64).
+
+          Descarga el de tu arquitectura, dale permisos de ejecución y comprueba la versión:
+
+          ```bash
+          chmod +x drivesync-*-x86_64-unknown-linux-gnu
+          ./drivesync-*-x86_64-unknown-linux-gnu --version
+          ```
+
+          Verifica la integridad con el `SHA256SUMS-<target>.txt` correspondiente.
+
+          Compilado desde el tag por GitHub Actions.
+          FIN
+
+      - name: Crear o actualizar release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "La release $TAG ya existe: se actualizan los adjuntos."
+            gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "drivesync $TAG" \
+              --notes-file notas.md \
+              --verify-tag
+          fi
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[] | "\(.name) (\(.size) bytes) → \(.url)"'
