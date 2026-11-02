@@ -396,7 +396,12 @@ pub fn run_manual(options: &ManualOptions) -> Result<Config> {
         "2. Autoriza la aplicación. El navegador intentará ir a {}\n   y mostrará un error de conexión: es lo esperado.",
         options.redirect_uri
     );
-    println!("3. Copia la URL completa de la barra de direcciones (contiene code=...) o pega un token de acceso.\n");
+    println!(
+        "3. Copia la URL COMPLETA de la barra de direcciones (empieza por http://127.0.0.1 y\n   contiene code=...), sin recortarla."
+    );
+    println!(
+        "   El navegador mostrará \"ERR_CONNECTION_REFUSED\": es correcto, no hay servidor\n   local escuchando en modo manual. Lo que importa es la URL, no la página.\n"
+    );
 
     print!("Pega la URL, el código o el token: ");
     std::io::stdout().flush().ok();
@@ -701,6 +706,24 @@ mod tests {
         assert_eq!(
             parsed.grant,
             ManualGrant::AccessToken("ya29.a0AfH6SMBx".to_string())
+        );
+    }
+
+    #[test]
+    fn interpreta_la_url_real_de_google() {
+        // Forma exacta que devuelve Google, con iss= intercalado y code=4/0A...
+        let input = "http://127.0.0.1:8765/callback?state=156300-1793626227045296881-0&iss=https://accounts.google.com&code=4/0AUn6Hd_rVnOy8LleCRy0M9NM2Ehuxhemq8goQAFZYXCGlNPBt_nZeKT9HXlcaaRszyb8jg&scope=https://www.googleapis.com/auth/drive";
+        let parsed = parse_manual_input(input).unwrap();
+        assert_eq!(
+            parsed.grant,
+            ManualGrant::Code(
+                "4/0AUn6Hd_rVnOy8LleCRy0M9NM2Ehuxhemq8goQAFZYXCGlNPBt_nZeKT9HXlcaaRszyb8jg"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            parsed.state.as_deref(),
+            Some("156300-1793626227045296881-0")
         );
     }
 
