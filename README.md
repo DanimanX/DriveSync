@@ -209,10 +209,32 @@ La URI de redirección no está autorizada en el cliente. Añade
 `http://127.0.0.1:8765/callback` en *URI de redirección autorizados*, o usa el
 mismo `--port` / `--redirect-uri` que tengas registrado.
 
-**`access_denied`**
+**`access_denied` — "DriveSync no completó el proceso de verificación de Google"**
 
-La app está en modo prueba y tu cuenta no está en la lista de *usuarios de
-prueba* de la pantalla de consentimiento.
+La app está en estado **Prueba** y la cuenta con la que autorizas no está en la
+lista de *usuarios de prueba*. Es el caso normal mientras la app no pasa la
+verificación de Google (el scope `drive` es restringido y verificarlo es un
+proceso aparte). Solución, en el proyecto donde creaste el `client_id`:
+
+1. <https://console.cloud.google.com/> → selecciona el proyecto.
+2. *APIs y servicios → Pantalla de consentimiento OAuth* (en la consola nueva,
+   *Google Auth Platform → Audience*).
+3. En **Usuarios de prueba** → *Add users* → escribe el correo exacto con el que
+   autorizas (por ejemplo `danimanx@gmail.com`) → *Save*.
+4. Espera un par de minutos y repite `drivesync auth`.
+
+Límites del modo prueba: hasta 100 usuarios de prueba y los **refresh tokens
+caducan a los 7 días**, así que toca reautorizar semanalmente. Para evitarlo hay
+que publicar la app (*Publish app*), lo que con un scope restringido como
+`drive` implica el proceso de verificación de Google; la alternativa práctica
+para uso propio es un cliente con el scope `drive.file`, o seguir usando
+`drivesync auth --access-token` con un token de corta duración en scripts.
+
+Comprueba qué cuenta tienes configurada y con qué cliente:
+
+```bash
+drivesync status
+```
 
 **`invalid_grant`**
 
