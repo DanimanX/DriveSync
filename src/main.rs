@@ -118,19 +118,26 @@ enum Command {
         #[arg(long, default_value_t = 200)]
         max: usize,
     },
-    /// Sube un archivo o una carpeta completa
+    /// Sube archivos o carpetas, recursivamente en el caso de carpetas
     Upload {
-        /// Archivo o carpeta local
-        path: PathBuf,
-        /// Carpeta de Drive de destino
-        #[arg(long = "to", value_name = "CARPETA")]
+        /// Archivos o carpetas a subir (varios)
+        #[arg(required = true, num_args = 1.., value_name = "RUTA")]
+        paths: Vec<PathBuf>,
+        /// Carpeta de Drive de destino (por defecto, la raíz)
+        #[arg(long = "to", visible_alias = "folder", value_name = "CARPETA")]
         remote: Option<String>,
-        /// Nombre remoto (solo al subir un archivo)
-        #[arg(long)]
+        /// Nombre remoto; solo con una ruta
+        #[arg(long, value_name = "NOMBRE")]
         name: Option<String>,
-        /// ID de un archivo existente que se debe reemplazar
+        /// ID de un archivo existente que se debe reemplazar; solo con una ruta
         #[arg(long, value_name = "ID")]
         replace: Option<String>,
+        /// Sube solo el contenido de la carpeta, sin crear la carpeta contenedora
+        #[arg(long)]
+        contents: bool,
+        /// Patrón a excluir, repetible: `*.tmp`, `cache/**`
+        #[arg(long, value_name = "PATRÓN")]
+        exclude: Vec<String>,
     },
     /// Descarga un archivo o una carpeta completa
     Download {
@@ -226,11 +233,15 @@ fn run(global: &Global, command: Command) -> Result<()> {
                 Command::Status => cmd_status(global, &client),
                 Command::List { folder, max } => cmd_list(global, &client, folder, max),
                 Command::Upload {
-                    path,
+                    paths,
                     remote,
                     name,
                     replace,
-                } => cmd_upload(global, &client, path, remote, name, replace),
+                    contents,
+                    exclude,
+                } => cmd_upload(
+                    global, &client, paths, remote, name, replace, contents, exclude,
+                ),
                 Command::Download {
                     remote,
                     dest,
@@ -541,17 +552,63 @@ fn cmd_list(
     Ok(())
 }
 
+#[derive(Debug, Default)]
+struct UploadStats {
+    uploaded: usize,
+    updated: usize,
+    skipped: usize,
+    folders: usize,
+    ignored: usize,
+    errors: Vec<String>,
+}
+
+impl UploadStats {
+    fn record(&mut self, outcome: UploadOutcome) {
+        match outcome {
+            UploadOutcome::Uploaded => self.uploaded += 1,
+            UploadOutcome::Updated => self.updated += 1,
+            UploadOutcome::Skipped => self.skipped += 1,
+            UploadOutcome::Simulated => {}
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UploadOutcome {
+    Uploaded,
+    Updated,
+    /// Ya estaba igual (mismo MD5).
+    Skipped,
+    /// `--dry-run`: se describió pero no se tocó nada.
+    Simulated,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn cmd_upload(
     global: &Global,
     client: &DriveClient,
-    path: PathBuf,
+    paths: Vec<PathBuf>,
     remote: Option<String>,
     name: Option<String>,
     replace: Option<String>,
+    contents: bool,
+    exclude: Vec<String>,
 ) -> Result<()> {
-    if !path.exists() {
-        bail!("no existe {}", path.display());
+    if paths.is_empty() {
+        bail!("indica al menos un archivo o una carpeta");
     }
+    for path in &paths {
+        if !path.exists() {
+            bail!("no existe {}", path.display());
+        }
+    }
+    if paths.len() > 1 && name.is_some() {
+        bail!("--name solo se puede usar con una única ruta");
+    }
+    if paths.len() > 1 && replace.is_some() {
+        bail!("--replace solo se puede usar con una única ruta");
+    }
+
     let target = match remote {
         Some(reference) => client.resolve_ref(&reference)?,
         None => client.root(),
@@ -560,32 +617,229 @@ fn cmd_upload(
         bail!("el destino '{}' no es una carpeta", target.name);
     }
 
-    if path.is_file() {
-        let name = match name {
-            Some(name) => name,
-            None => file_name(&path)?,
+    let mut stats = UploadStats::default();
+    let mut tombstones = Vec::new();
+
+    for path in &paths {
+        let result = if path.is_file() {
+            let remote_name = match &name {
+                Some(name) => name.clone(),
+                None => file_name(path)?,
+            };
+            if remote_name.contains('/') || remote_name.contains('\\') {
+                bail!("el nombre remoto no puede contener separadores: {remote_name}");
+            }
+            upload_one(
+                client,
+                path,
+                &target,
+                &remote_name,
+                replace.as_deref(),
+                global.dry_run,
+                global.quiet,
+            )
+            .map(|outcome| {
+                stats.record(outcome);
+            })
+        } else if path.is_dir() {
+            let dir_name = match &name {
+                Some(name) => name.clone(),
+                None => file_name(path)?,
+            };
+            // Por defecto la carpeta local se replica dentro del destino;
+            // con --contents se sube solo lo que hay dentro.
+            let (parent, prefix) = if contents {
+                (Some(target.clone()), String::new())
+            } else {
+                match ensure_child_folder(client, &target, &dir_name, global.dry_run, global.quiet)
+                {
+                    Ok(Some(folder)) => (Some(folder), String::new()),
+                    Ok(None) => (None, String::new()),
+                    Err(error) => Err(error)?,
+                }
+            };
+            if !global.quiet && !global.dry_run && parent.is_some() {
+                stats.folders += 1;
+            }
+            upload_dir(
+                client,
+                path,
+                parent.as_ref(),
+                &prefix,
+                &exclude,
+                global.dry_run,
+                global.quiet,
+                &mut stats,
+            )
+        } else {
+            bail!("{} no es un archivo ni un directorio", path.display());
         };
-        if name.contains('/') {
-            bail!("el nombre remoto no puede contener '/'");
+
+        if let Err(error) = result {
+            let message = format!("{}: {error:#}", path.display());
+            eprintln!("[error] {message}");
+            stats.errors.push(message);
         }
-        upload_one(
-            client,
-            &path,
-            &target,
-            &name,
-            replace.as_deref(),
-            global.dry_run,
-            global.quiet,
-        )?;
-    } else if path.is_dir() {
-        if replace.is_some() {
-            bail!("--replace solo aplica a un archivo, no a una carpeta");
+        tombstones.push(path.clone());
+    }
+
+    // Resumen
+    if !global.quiet {
+        let mut partes = Vec::new();
+        if stats.uploaded > 0 {
+            partes.push(format!("{} subidos", stats.uploaded));
         }
-        upload_tree(client, &path, &target, global.dry_run, global.quiet)?;
-    } else {
-        bail!("{} no es un archivo ni un directorio", path.display());
+        if stats.updated > 0 {
+            partes.push(format!("{} actualizados", stats.updated));
+        }
+        if stats.skipped > 0 {
+            partes.push(format!("{} sin cambios", stats.skipped));
+        }
+        if stats.folders > 0 {
+            partes.push(format!("{} carpetas creadas", stats.folders));
+        }
+        if stats.ignored > 0 {
+            partes.push(format!("{} omitidos", stats.ignored));
+        }
+        if partes.is_empty() {
+            partes.push("nada que subir".to_string());
+        }
+        println!(
+            "{}{}",
+            if global.dry_run {
+                "Simulación: "
+            } else {
+                "Resumen: "
+            },
+            partes.join(", ")
+        );
+    }
+
+    if !stats.errors.is_empty() {
+        bail!(
+            "{} elemento(s) fallaron de {} ruta(s)",
+            stats.errors.len(),
+            tombstones.len()
+        );
     }
     Ok(())
+}
+
+/// Recorre un directorio local subiéndolo en profundidad.
+#[allow(clippy::too_many_arguments)]
+fn upload_dir(
+    client: &DriveClient,
+    local_dir: &Path,
+    remote_dir: Option<&api::RemoteFile>,
+    prefix: &str,
+    exclude: &[String],
+    dry_run: bool,
+    quiet: bool,
+    stats: &mut UploadStats,
+) -> Result<()> {
+    let mut entries: Vec<fs::DirEntry> = fs::read_dir(local_dir)
+        .with_context(|| format!("no se pudo leer {}", local_dir.display()))?
+        .collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == sync::STATE_DIR {
+            continue;
+        }
+        let rel = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if util::is_excluded(&rel, exclude) {
+            if !quiet {
+                println!("[omitido] {rel} (excluido)");
+            }
+            stats.ignored += 1;
+            continue;
+        }
+
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("no se pudo leer {}", path.display()))?;
+
+        if file_type.is_symlink() {
+            eprintln!("[aviso] omitido (enlace simbólico): {rel}");
+            stats.ignored += 1;
+            continue;
+        }
+
+        if file_type.is_dir() {
+            // Sin destino remoto conocido (simulación) se describe y se sigue.
+            // Un fallo al crear esta carpeta no debe abortar el resto del árbol.
+            let child = match remote_dir {
+                Some(parent) => match ensure_child_folder(client, parent, &name, dry_run, quiet) {
+                    Ok(folder) => {
+                        if folder.is_some() {
+                            stats.folders += 1;
+                        }
+                        folder
+                    }
+                    Err(error) => {
+                        let message = format!("{rel}: {error:#}");
+                        eprintln!("[error] {message}");
+                        stats.errors.push(message);
+                        continue;
+                    }
+                },
+                None => None,
+            };
+            if let Err(error) = upload_dir(
+                client,
+                &path,
+                child.as_ref(),
+                &rel,
+                exclude,
+                dry_run,
+                quiet,
+                stats,
+            ) {
+                let message = format!("{rel}: {error:#}");
+                eprintln!("[error] {message}");
+                stats.errors.push(message);
+            }
+        } else if file_type.is_file() {
+            match upload_file_in_dir(client, &path, remote_dir, &name, dry_run, quiet) {
+                Ok(outcome) => stats.record(outcome),
+                Err(error) => {
+                    let message = format!("{rel}: {error:#}");
+                    eprintln!("[error] {message}");
+                    stats.errors.push(message);
+                }
+            }
+        } else {
+            eprintln!("[aviso] omitido (no es archivo regular): {rel}");
+            stats.ignored += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Sube un archivo dentro de un recorrido; en simulación no consulta la API.
+fn upload_file_in_dir(
+    client: &DriveClient,
+    path: &Path,
+    remote_dir: Option<&api::RemoteFile>,
+    name: &str,
+    dry_run: bool,
+    quiet: bool,
+) -> Result<UploadOutcome> {
+    match remote_dir {
+        Some(parent) => upload_one(client, path, parent, name, None, dry_run, quiet),
+        None => {
+            if !quiet {
+                println!("haría[subir] {name}");
+            }
+            Ok(UploadOutcome::Simulated)
+        }
+    }
 }
 
 fn upload_one(
@@ -596,46 +850,50 @@ fn upload_one(
     replace_id: Option<&str>,
     dry_run: bool,
     quiet: bool,
-) -> Result<()> {
+) -> Result<UploadOutcome> {
     let mime = util::mime_for(path);
 
     if let Some(file_id) = replace_id {
         if dry_run {
             println!("haría[actualizar-remoto] {name}");
-            return Ok(());
+            return Ok(UploadOutcome::Simulated);
         }
         client.update_file(file_id, mime, path)?;
         if !quiet {
             println!("[actualizado] {name} — {file_id}");
         }
-        return Ok(());
+        return Ok(UploadOutcome::Updated);
     }
 
     let md5 = util::md5_file(path)?;
     match client.find_child(&target.id, name)? {
         Some(existing) => {
             if existing.is_folder() {
-                bail!("ya existe una carpeta llamada '{name}' en {}", target.name);
+                bail!(
+                    "ya existe una carpeta llamada '{name}' en '{}'",
+                    target.name
+                );
             }
             if existing.md5_checksum.as_deref() == Some(md5.as_str()) {
                 if !quiet {
                     println!("[igual] {name}");
                 }
-                return Ok(());
+                return Ok(UploadOutcome::Skipped);
             }
             if dry_run {
                 println!("haría[actualizar-remoto] {name}");
-                return Ok(());
+                return Ok(UploadOutcome::Simulated);
             }
             client.update_file(&existing.id, mime, path)?;
             if !quiet {
                 println!("[actualizado] {name} — {}", existing.id);
             }
+            Ok(UploadOutcome::Updated)
         }
         None => {
             if dry_run {
                 println!("haría[subir] {name}");
-                return Ok(());
+                return Ok(UploadOutcome::Simulated);
             }
             let created = client.create_file(&target.id, name, mime, path)?;
             if !quiet {
@@ -645,53 +903,9 @@ fn upload_one(
                     created.id
                 );
             }
+            Ok(UploadOutcome::Uploaded)
         }
     }
-    Ok(())
-}
-
-fn upload_tree(
-    client: &DriveClient,
-    local_root: &Path,
-    target: &api::RemoteFile,
-    dry_run: bool,
-    quiet: bool,
-) -> Result<()> {
-    let mut stack = vec![(local_root.to_path_buf(), target.clone())];
-
-    while let Some((dir, remote_dir)) = stack.pop() {
-        let mut entries: Vec<fs::DirEntry> = fs::read_dir(&dir)
-            .with_context(|| format!("no se pudo leer {}", dir.display()))?
-            .collect::<std::io::Result<Vec<_>>>()?;
-        entries.sort_by_key(|entry| entry.file_name());
-
-        for entry in entries {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name == sync::STATE_DIR {
-                continue;
-            }
-            let path = entry.path();
-            let file_type = entry
-                .file_type()
-                .with_context(|| format!("no se pudo leer {}", path.display()))?;
-
-            if file_type.is_symlink() {
-                eprintln!("[aviso] omitido (enlace simbólico): {}", path.display());
-            } else if file_type.is_dir() {
-                match ensure_child_folder(client, &remote_dir, &name, dry_run, quiet)? {
-                    Some(folder) => stack.push((path, folder)),
-                    None => {
-                        if !quiet {
-                            println!("[omitido] {name}/ (simulación)");
-                        }
-                    }
-                }
-            } else if file_type.is_file() {
-                upload_one(client, &path, &remote_dir, &name, None, dry_run, quiet)?;
-            }
-        }
-    }
-    Ok(())
 }
 
 fn ensure_child_folder(
@@ -703,7 +917,10 @@ fn ensure_child_folder(
 ) -> Result<Option<api::RemoteFile>> {
     if let Some(existing) = client.find_child(&parent.id, name)? {
         if !existing.is_folder() {
-            bail!("ya existe un archivo llamado '{name}' donde debería ir una carpeta");
+            bail!(
+                "ya existe un archivo llamado '{name}' en '{}'; no se puede usar como carpeta",
+                parent.name
+            );
         }
         return Ok(Some(existing));
     }

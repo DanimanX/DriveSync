@@ -138,7 +138,15 @@ pub fn is_excluded(rel_path: &str, patterns: &[String]) -> bool {
             return false;
         }
         let pattern = pattern.trim_end_matches('/');
-        glob_match(pattern, rel_path)
+        // `cache/**` debe excluir también la propia carpeta `cache`, no solo
+        // su contenido: si no, se crearía vacía en el destino.
+        let prefijo_excluido = pattern
+            .strip_suffix("/**")
+            .map(|prefijo| glob_match(prefijo, rel_path))
+            .unwrap_or(false);
+
+        prefijo_excluido
+            || glob_match(pattern, rel_path)
             || glob_match(pattern, base)
             || glob_match(&format!("{pattern}/**"), rel_path)
     })
@@ -271,6 +279,9 @@ mod tests {
         assert!(is_excluded("a/nota.tmp", &patterns));
         assert!(is_excluded("cache/x/y.bin", &patterns));
         assert!(!is_excluded("docs/nota.md", &patterns));
+        // La carpeta que precede a `/**` también queda excluida.
+        assert!(is_excluded("cache", &patterns));
+        assert!(!is_excluded("caches", &patterns));
     }
 
     #[test]

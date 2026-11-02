@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/DanimanX/DriveSync/actions/workflows/ci.yml/badge.svg)](https://github.com/DanimanX/DriveSync/actions/workflows/ci.yml)
 
-Versión 0.2.1 · CLI en Rust para sincronizar archivos y carpetas con Google Drive usando un
+Versión 0.3.0 · CLI en Rust para sincronizar archivos y carpetas con Google Drive usando un
 token de Google. Sin SDKs pesados: habla directamente con la API v3 de Drive
 sobre HTTPS, guarda el estado de la sincronización y resuelve conflictos sin
 perder ninguna versión.
@@ -42,7 +42,7 @@ Cada tag publica una release con los binarios de `x86_64` y `aarch64` en
 <https://github.com/DanimanX/DriveSync/releases>.
 
 ```bash
-tag=v0.2.1
+tag=v0.3.0
 arch=x86_64-unknown-linux-gnu        # o aarch64-unknown-linux-gnu
 base="https://github.com/DanimanX/DriveSync/releases/download/$tag"
 
@@ -252,7 +252,7 @@ Vuelve a ejecutar `drivesync auth`.
 
 ```
 drivesync list   [--folder CARPETA] [--max N]
-drivesync upload ARCHIVO_O_CARPETA [--to CARPETA] [--name NOMBRE] [--replace ID]
+drivesync upload RUTA... [--to CARPETA] [--name NOMBRE] [--contents] [--exclude PATRÓN]
 drivesync download REMOTO [--to RUTA] [--overwrite]
 drivesync mkdir  NOMBRE [--folder CARPETA] [--literal]
 drivesync sync   DIRECTORIO --remote CARPETA [opciones]
@@ -287,8 +287,15 @@ drivesync list --folder Backup/2026
 # Subir un archivo (si ya existe, se actualiza)
 drivesync upload ./informe.pdf --to Backup
 
-# Subir un directorio completo creando las subcarpetas que falten
-drivesync upload ./proyecto --to Backup/Codigo
+# Subir una carpeta completa de forma recursiva: crea Backup/proyecto/...
+drivesync upload ./proyecto --to Backup
+
+# Subir solo el contenido, sin crear la carpeta contenedora
+drivesync upload ./proyecto --to Backup/Codigo --contents
+
+# Varias rutas de una vez, excluyendo temporales y cachés
+drivesync upload ./proyecto ./informe.pdf --to Backup \
+  --exclude '*.tmp' --exclude 'cache/**' --exclude '.git' 
 
 # Descargar una carpeta entera a ./restaurado
 drivesync download Backup/Codigo --to ./restaurado --overwrite
@@ -306,6 +313,33 @@ drivesync sync ./documentos --remote Backup/Documentos --direction push --delete
 # Solo bajar cambios (el remoto manda)
 drivesync sync ./documentos --remote Backup/Documentos --direction pull
 ```
+
+## Subida recursiva
+
+`upload` acepta uno o varios archivos o carpetas y recorre las carpetas en
+profundidad, creando la estructura de subcarpetas que falte en Drive.
+
+```bash
+drivesync upload ./proyecto --to Backup            # Backup/proyecto/{...}
+drivesync upload ./proyecto --to Backup --contents # Backup/{...} sin la carpeta
+drivesync upload a.txt b/ c/ --to Backup           # varias rutas a la vez
+drivesync upload ./proyecto --to Backup --dry-run  # solo describe
+```
+
+- **Idempotente**: compara el MD5 de cada archivo con el que reporta Drive y
+  omite los que ya están iguales. Volver a subir el mismo árbol no genera
+  escrituras.
+- **Carpetas vacías**: también se crean.
+- **Exclusiones**: `--exclude` con comodines `*` y `?`, repetible. Aplica a
+  rutas, nombres base y subárboles; `cache/**` excluye además la propia carpeta.
+- **Enlaces simbólicos** y archivos especiales se omiten con aviso.
+- **`--name`** renombra una única ruta; **`--replace ID`** sobrescribe un
+  archivo concreto de Drive.
+- **Resiliencia**: si un elemento falla (por ejemplo ya existe un archivo donde
+  debería ir una carpeta), se informa, se continúa con el resto y el comando
+  termina con código distinto de cero.
+- **Resumen** al final: subidos, actualizados, sin cambios, carpetas creadas y
+  omitidos.
 
 ## Cómo funciona la sincronización
 

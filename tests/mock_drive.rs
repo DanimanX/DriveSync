@@ -1542,6 +1542,252 @@ fn las_rutas_con_barra_invertida_sirven_en_todos_los_comandos() {
 }
 
 #[test]
+fn upload_replica_el_arbol_recursivamente() {
+    let mock = MockDrive::start();
+    let work = tempfile::tempdir().unwrap();
+    let config = config_path(work.path());
+    let proyecto = work.path().join("proyecto");
+    fs::create_dir_all(proyecto.join("src/nucleo")).unwrap();
+    fs::create_dir_all(proyecto.join("vacia")).unwrap();
+    fs::write(proyecto.join("README.md"), b"raiz").unwrap();
+    fs::write(proyecto.join("src/main.rs"), b"main").unwrap();
+    fs::write(proyecto.join("src/nucleo/mod.rs"), b"nucleo").unwrap();
+    let backup = mock.add_folder("Backup", "root");
+
+    let output = run_cli(
+        mock.base(),
+        &config,
+        &["upload", proyecto.to_str().unwrap(), "--to", "Backup"],
+    );
+    assert_ok(&output);
+    let out = stdout(&output);
+    assert!(out.contains("3 subidos"), "{out}");
+    assert!(out.contains("4 carpetas creadas"), "{out}");
+
+    // Backup/proyecto/{README.md, src/{main.rs, nucleo/mod.rs}, vacia}
+    let en_backup = mock.children(&backup);
+    let raiz = en_backup
+        .iter()
+        .find(|f| f.name == "proyecto")
+        .expect("debe existir la carpeta proyecto");
+    assert!(raiz.mime == FOLDER_MIME);
+
+    let nivel1: Vec<String> = mock
+        .children(&raiz.id)
+        .into_iter()
+        .map(|f| f.name)
+        .collect();
+    assert!(nivel1.contains(&"README.md".to_string()), "{nivel1:?}");
+    assert!(nivel1.contains(&"src".to_string()), "{nivel1:?}");
+    assert!(
+        nivel1.contains(&"vacia".to_string()),
+        "las vacías cuentan: {nivel1:?}"
+    );
+
+    let src = mock
+        .children(&raiz.id)
+        .into_iter()
+        .find(|f| f.name == "src")
+        .unwrap();
+    let nivel2: Vec<String> = mock.children(&src.id).into_iter().map(|f| f.name).collect();
+    assert!(nivel2.contains(&"main.rs".to_string()), "{nivel2:?}");
+    assert!(nivel2.contains(&"nucleo".to_string()), "{nivel2:?}");
+
+    let nucleo = mock
+        .children(&src.id)
+        .into_iter()
+        .find(|f| f.name == "nucleo")
+        .unwrap();
+    let nivel3: Vec<String> = mock
+        .children(&nucleo.id)
+        .into_iter()
+        .map(|f| f.name)
+        .collect();
+    assert_eq!(nivel3, vec!["mod.rs".to_string()]);
+
+    assert_eq!(
+        mock.content_by_name("mod.rs").as_deref(),
+        Some(&b"nucleo"[..])
+    );
+
+    // Segunda pasada: nada cambia.
+    let output = run_cli(
+        mock.base(),
+        &config,
+        &["upload", proyecto.to_str().unwrap(), "--to", "Backup"],
+    );
+    assert_ok(&output);
+    assert!(
+        stdout(&output).contains("3 sin cambios"),
+        "{}",
+        stdout(&output)
+    );
+
+    // Un archivo modificado se actualiza.
+    fs::write(proyecto.join("src/main.rs"), b"main v2").unwrap();
+    let output = run_cli(
+        mock.base(),
+        &config,
+        &["upload", proyecto.to_str().unwrap(), "--to", "Backup"],
+    );
+    assert_ok(&output);
+    assert!(
+        stdout(&output).contains("1 actualizados"),
+        "{}",
+        stdout(&output)
+    );
+    assert_eq!(
+        mock.content_by_name("main.rs").as_deref(),
+        Some(&b"main v2"[..])
+    );
+}
+
+#[test]
+fn upload_acepta_varias_rutas_y_contenido_suelto() {
+    let mock = MockDrive::start();
+    let work = tempfile::tempdir().unwrap();
+    let config = config_path(work.path());
+    let docs = work.path().join("docs");
+    fs::create_dir_all(&docs).unwrap();
+    fs::write(docs.join("a.txt"), b"a").unwrap();
+    fs::write(work.path().join("suelto.txt"), b"suelto").unwrap();
+    let backup = mock.add_folder("Backup", "root");
+
+    // Varias rutas a la vez.
+    let output = run_cli(
+        mock.base(),
+        &config,
+        &[
+            "upload",
+            docs.to_str().unwrap(),
+            work.path().join("suelto.txt").to_str().unwrap(),
+            "--to",
+            "Backup",
+        ],
+    );
+    assert_ok(&output);
+    let nivel: Vec<String> = mock.children(&backup).into_iter().map(|f| f.name).collect();
+    assert!(nivel.contains(&"docs".to_string()), "{nivel:?}");
+    assert!(nivel.contains(&"suelto.txt".to_string()), "{nivel:?}");
+
+    // --contents sube el contenido sin crear la carpeta contenedora.
+    let otro = work.path().join("otro");
+    fs::create_dir_all(otro.join("sub")).unwrap();
+    fs::write(otro.join("sub/b.txt"), b"b").unwrap();
+    let output = run_cli(
+        mock.base(),
+        &config,
+        &[
+            "upload",
+            otro.to_str().unwrap(),
+            "--to",
+            "Backup",
+            "--contents",
+        ],
+    );
+    assert_ok(&output);
+    let nivel: Vec<String> = mock.children(&backup).into_iter().map(|f| f.name).collect();
+    assert!(nivel.contains(&"sub".to_string()), "{nivel:?}");
+    assert!(!nivel.contains(&"otro".to_string()), "{nivel:?}");
+}
+
+#[test]
+fn upload_excluye_patrones_y_respeta_dry_run() {
+    let mock = MockDrive::start();
+    let work = tempfile::tempdir().unwrap();
+    let config = config_path(work.path());
+    let proyecto = work.path().join("proyecto");
+    fs::create_dir_all(proyecto.join("cache")).unwrap();
+    fs::write(proyecto.join("keep.txt"), b"keep").unwrap();
+    fs::write(proyecto.join("temporal.tmp"), b"tmp").unwrap();
+    fs::write(proyecto.join("cache/blob.bin"), b"bin").unwrap();
+    let backup = mock.add_folder("Backup", "root");
+
+    // Simulación: no debe crear nada.
+    let output = run_cli(
+        mock.base(),
+        &config,
+        &[
+            "upload",
+            proyecto.to_str().unwrap(),
+            "--to",
+            "Backup",
+            "--dry-run",
+        ],
+    );
+    assert_ok(&output);
+    assert!(
+        stdout(&output).contains("haría[subir]"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(
+        mock.children(&backup).is_empty(),
+        "la simulación no crea nada"
+    );
+
+    let output = run_cli(
+        mock.base(),
+        &config,
+        &[
+            "upload",
+            proyecto.to_str().unwrap(),
+            "--to",
+            "Backup",
+            "--exclude",
+            "*.tmp",
+            "--exclude",
+            "cache/**",
+        ],
+    );
+    assert_ok(&output);
+    let raiz = mock
+        .children(&backup)
+        .into_iter()
+        .find(|f| f.name == "proyecto")
+        .expect("carpeta proyecto");
+    let nivel: Vec<String> = mock
+        .children(&raiz.id)
+        .into_iter()
+        .map(|f| f.name)
+        .collect();
+    assert_eq!(nivel, vec!["keep.txt".to_string()], "{nivel:?}");
+    assert!(mock.content_by_name("temporal.tmp").is_none());
+    assert!(mock.content_by_name("blob.bin").is_none());
+}
+
+#[test]
+fn upload_sigue_tras_un_error_y_termina_con_fallo() {
+    let mock = MockDrive::start();
+    let work = tempfile::tempdir().unwrap();
+    let config = config_path(work.path());
+    let proyecto = work.path().join("proyecto");
+    fs::create_dir_all(&proyecto).unwrap();
+    fs::write(proyecto.join("aaa.txt"), b"a").unwrap();
+    fs::write(proyecto.join("zzz.txt"), b"z").unwrap();
+    let backup = mock.add_folder("Backup", "root");
+
+    // Un archivo remoto con el nombre de una carpeta local hace fallar esa rama.
+    let raiz = mock.add_folder("proyecto", &backup);
+    mock.add_file("sub", &raiz, b"archivo-que-estorba");
+    fs::create_dir_all(proyecto.join("sub")).unwrap();
+    fs::write(proyecto.join("sub/dentro.txt"), b"dentro").unwrap();
+
+    let output = run_cli(
+        mock.base(),
+        &config,
+        &["upload", proyecto.to_str().unwrap(), "--to", "Backup"],
+    );
+    // Termina con error...
+    assert!(!output.status.success());
+    // ...pero los archivos que no dependían del conflicto se subieron igual.
+    assert_eq!(mock.content_by_name("aaa.txt").as_deref(), Some(&b"a"[..]));
+    assert_eq!(mock.content_by_name("zzz.txt").as_deref(), Some(&b"z"[..]));
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("sub"), "{err}");
+}
+
+#[test]
 fn guarda_el_token_y_consulta_la_cuenta() {
     let mock = MockDrive::start();
     let work = tempfile::tempdir().unwrap();
