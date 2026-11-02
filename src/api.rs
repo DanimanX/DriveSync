@@ -582,8 +582,17 @@ impl DriveClient {
         {
             return Ok(self.root());
         }
-        if reference.contains('/') {
-            return self.resolve_path(reference);
+        if reference.contains('/') || reference.contains('\\') {
+            match self.resolve_path(reference) {
+                Ok(found) => return Ok(found),
+                Err(error_ruta) => {
+                    // Puede ser un nombre que contiene una barra: se intenta tal cual.
+                    if let Some(found) = self.find_child("root", reference)? {
+                        return Ok(found);
+                    }
+                    return Err(error_ruta);
+                }
+            }
         }
         if looks_like_id(reference) {
             if let Ok(found) = self.get_file(reference) {
@@ -614,12 +623,12 @@ impl DriveClient {
 
     pub fn resolve_path(&self, path: &str) -> Result<RemoteFile> {
         let mut current = self.root();
-        for part in path.split('/').filter(|p| !p.is_empty() && *p != ".") {
+        for part in util::split_folder_path(path)? {
             let children = self.list_children(&current.id)?;
             let found = children
                 .iter()
                 .find(|f| f.name == part)
-                .or_else(|| children.iter().find(|f| f.name.eq_ignore_ascii_case(part)));
+                .or_else(|| children.iter().find(|f| f.name.eq_ignore_ascii_case(&part)));
             match found {
                 Some(file) => current = file.clone(),
                 None => bail!(

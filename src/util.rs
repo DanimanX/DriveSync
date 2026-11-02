@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use md5::{Digest, Md5};
 
 /// Calcula el MD5 de un archivo leyéndolo por bloques (nunca lo carga entero).
@@ -220,6 +220,29 @@ pub fn split_rel(rel: &str) -> (&str, &str) {
     }
 }
 
+/// Separa los componentes de una ruta escrita por el usuario.
+///
+/// Acepta `/` y también `\` como separadores, porque es lo que teclea quien
+/// viene de Windows (`Recomp\NSW 2`). Se ignoran componentes vacíos y `.`,
+/// y se rechaza `..` para no crear rutas ambiguas.
+pub fn split_folder_path(value: &str) -> Result<Vec<String>> {
+    let mut parts = Vec::new();
+    for raw in value.split(['/', '\\']) {
+        let part = raw.trim();
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            bail!("la ruta no puede contener '..': {value}");
+        }
+        parts.push(part.to_string());
+    }
+    if parts.is_empty() {
+        bail!("el nombre de la carpeta no puede estar vacío");
+    }
+    Ok(parts)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +290,23 @@ mod tests {
     fn consulta_escapada() {
         assert_eq!(escape_query("O'Brien"), "O\\'Brien");
         assert_eq!(escape_query("a\\b"), "a\\\\b");
+    }
+
+    #[test]
+    fn separa_rutas_de_carpeta() {
+        assert_eq!(
+            split_folder_path("Recomp/NSW 2").unwrap(),
+            vec!["Recomp", "NSW 2"]
+        );
+        assert_eq!(
+            split_folder_path("Recomp\\NSW 2").unwrap(),
+            vec!["Recomp", "NSW 2"]
+        );
+        assert_eq!(split_folder_path("  a / b / ").unwrap(), vec!["a", "b"]);
+        assert_eq!(split_folder_path("./a/./b").unwrap(), vec!["a", "b"]);
+        assert_eq!(split_folder_path("Solo").unwrap(), vec!["Solo"]);
+        assert!(split_folder_path("   ").is_err());
+        assert!(split_folder_path("a/../b").is_err());
     }
 
     #[test]

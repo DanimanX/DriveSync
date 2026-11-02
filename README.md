@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/DanimanX/DriveSync/actions/workflows/ci.yml/badge.svg)](https://github.com/DanimanX/DriveSync/actions/workflows/ci.yml)
 
-Versión 0.2.0 · CLI en Rust para sincronizar archivos y carpetas con Google Drive usando un
+Versión 0.2.1 · CLI en Rust para sincronizar archivos y carpetas con Google Drive usando un
 token de Google. Sin SDKs pesados: habla directamente con la API v3 de Drive
 sobre HTTPS, guarda el estado de la sincronización y resuelve conflictos sin
 perder ninguna versión.
@@ -42,7 +42,7 @@ Cada tag publica una release con los binarios de `x86_64` y `aarch64` en
 <https://github.com/DanimanX/DriveSync/releases>.
 
 ```bash
-tag=v0.2.0
+tag=v0.2.1
 arch=x86_64-unknown-linux-gnu        # o aarch64-unknown-linux-gnu
 base="https://github.com/DanimanX/DriveSync/releases/download/$tag"
 
@@ -254,7 +254,7 @@ Vuelve a ejecutar `drivesync auth`.
 drivesync list   [--folder CARPETA] [--max N]
 drivesync upload ARCHIVO_O_CARPETA [--to CARPETA] [--name NOMBRE] [--replace ID]
 drivesync download REMOTO [--to RUTA] [--overwrite]
-drivesync mkdir  NOMBRE [--in CARPETA]
+drivesync mkdir  NOMBRE [--folder CARPETA] [--literal]
 drivesync sync   DIRECTORIO --remote CARPETA [opciones]
 drivesync status
 drivesync logout
@@ -262,6 +262,21 @@ drivesync logout
 
 `CARPETA`/`REMOTO` aceptan un **ID** de Drive, una **ruta** desde *Mi unidad*
 (`Backup/Fotos/2026`) o un **nombre** (se busca y se avisa si hay duplicados).
+
+En las rutas vale tanto `/` como `\`, así que `Backup\Fotos\2026` y
+`Backup/Fotos/2026` son lo mismo. `mkdir` además crea las carpetas
+intermedias que falten:
+
+```bash
+drivesync mkdir "Recomp/NSW 2"            # crea Recomp si no existe y NSW 2 dentro
+drivesync mkdir --folder Recomp "NSW 2"   # equivalente, con el nombre suelto
+drivesync mkdir "Recomp\GBA 2"            # estilo Windows, también válido
+drivesync mkdir --literal "c\raro"        # nombre literal, sin separar
+```
+
+Solo `mkdir` admite `--literal`; el resto de comandos interpretan `\` como
+separador, así que una carpeta cuyo nombre contenga una barra invertida debe
+referenciarse por su ID.
 
 ### Ejemplos
 

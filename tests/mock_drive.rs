@@ -1426,6 +1426,122 @@ fn check_client_acepta_un_id_existente() {
 }
 
 #[test]
+fn mkdir_crea_subcarpetas_anidadas() {
+    let mock = MockDrive::start();
+    let work = tempfile::tempdir().unwrap();
+    let config = config_path(work.path());
+    let recomp = mock.add_folder("Recomp", "root");
+
+    // 1) Ruta con separador: debe crear NSW 2 DENTRO de Recomp.
+    let output = run_cli(mock.base(), &config, &["mkdir", "Recomp/NSW 2"]);
+    assert_ok(&output);
+    let out = stdout(&output);
+    assert!(out.contains("Carpeta creada: Recomp/NSW 2/"), "{out}");
+    assert!(out.contains("dentro de 'Mi unidad'"), "{out}");
+
+    let dentro: Vec<String> = mock.children(&recomp).into_iter().map(|f| f.name).collect();
+    assert_eq!(dentro, vec!["NSW 2".to_string()], "debe colgar de Recomp");
+    let raiz: Vec<String> = mock.children("root").into_iter().map(|f| f.name).collect();
+    assert!(
+        !raiz
+            .iter()
+            .any(|name| name.contains('/') || name.contains("NSW")),
+        "no debe crear nada en la raíz: {raiz:?}"
+    );
+
+    // 2) Estilo Windows con barra invertida.
+    let output = run_cli(mock.base(), &config, &["mkdir", "Recomp\\GBA 2"]);
+    assert_ok(&output);
+    let dentro: Vec<String> = mock.children(&recomp).into_iter().map(|f| f.name).collect();
+    assert!(
+        dentro.contains(&"GBA 2".to_string()),
+        "la barra invertida también debe separar: {dentro:?}"
+    );
+
+    // 3) --folder con nombre simple.
+    let output = run_cli(
+        mock.base(),
+        &config,
+        &["mkdir", "--folder", "Recomp", "NDS 2"],
+    );
+    assert_ok(&output);
+    let dentro: Vec<String> = mock.children(&recomp).into_iter().map(|f| f.name).collect();
+    assert!(dentro.contains(&"NDS 2".to_string()), "{dentro:?}");
+
+    // 4) Intermedios que no existen se crean (mkdir -p).
+    let output = run_cli(mock.base(), &config, &["mkdir", "Recomp/PSX 2/ISOs"]);
+    assert_ok(&output);
+    let psx = mock
+        .children(&recomp)
+        .into_iter()
+        .find(|f| f.name == "PSX 2")
+        .expect("PSX 2 debe existir");
+    let isos: Vec<String> = mock.children(&psx.id).into_iter().map(|f| f.name).collect();
+    assert_eq!(isos, vec!["ISOs".to_string()]);
+
+    // 5) Repetir no duplica.
+    let output = run_cli(mock.base(), &config, &["mkdir", "Recomp/NSW 2"]);
+    assert_ok(&output);
+    let dentro: Vec<String> = mock.children(&recomp).into_iter().map(|f| f.name).collect();
+    let repes = dentro.iter().filter(|name| *name == "NSW 2").count();
+    assert_eq!(repes, 1, "no debe duplicar: {dentro:?}");
+
+    // 6) --dry-run no crea nada.
+    let antes = mock.children("root").len();
+    let output = run_cli(
+        mock.base(),
+        &config,
+        &["mkdir", "Recomp/Nueva", "--dry-run"],
+    );
+    assert_ok(&output);
+    assert!(
+        stdout(&output).contains("Recomp/Nueva"),
+        "{}",
+        stdout(&output)
+    );
+    let dentro: Vec<String> = mock.children(&recomp).into_iter().map(|f| f.name).collect();
+    assert!(!dentro.contains(&"Nueva".to_string()), "{dentro:?}");
+    assert_eq!(mock.children("root").len(), antes);
+}
+
+#[test]
+fn las_rutas_con_barra_invertida_sirven_en_todos_los_comandos() {
+    let mock = MockDrive::start();
+    let work = tempfile::tempdir().unwrap();
+    let config = config_path(work.path());
+    let recomp = mock.add_folder("Recomp", "root");
+    let nsw = mock.add_folder("NSW 2", &recomp);
+    mock.add_file("juego.nsp", &nsw, b"contenido");
+
+    // list con ruta de Windows
+    let output = run_cli(mock.base(), &config, &["list", "--folder", "Recomp\\NSW 2"]);
+    assert_ok(&output);
+    assert!(stdout(&output).contains("juego.nsp"), "{}", stdout(&output));
+
+    // download con ruta de Windows
+    let dest = work.path().join("bajado");
+    fs::create_dir_all(&dest).unwrap();
+    let output = run_cli_in(
+        mock.base(),
+        &config,
+        &dest,
+        &["download", "Recomp\\NSW 2\\juego.nsp"],
+    );
+    assert_ok(&output);
+    assert_eq!(fs::read(dest.join("juego.nsp")).unwrap(), b"contenido");
+
+    // mkdir --folder con ruta de Windows
+    let output = run_cli(
+        mock.base(),
+        &config,
+        &["mkdir", "--folder", "Recomp\\NSW 2", "DLC"],
+    );
+    assert_ok(&output);
+    let dentro: Vec<String> = mock.children(&nsw).into_iter().map(|f| f.name).collect();
+    assert!(dentro.contains(&"DLC".to_string()), "{dentro:?}");
+}
+
+#[test]
 fn guarda_el_token_y_consulta_la_cuenta() {
     let mock = MockDrive::start();
     let work = tempfile::tempdir().unwrap();

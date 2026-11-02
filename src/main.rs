@@ -143,12 +143,16 @@ enum Command {
         #[arg(long)]
         overwrite: bool,
     },
-    /// Crea una carpeta en Drive
+    /// Crea una carpeta en Drive, incluidas las intermedias que falten
     Mkdir {
+        /// Nombre o ruta relativa: `Backup`, `Recomp/NSW 2`, `Recomp\\GBA 2`
         name: String,
         /// Carpeta contenedora (por defecto, la raíz)
-        #[arg(long = "in", value_name = "CARPETA")]
+        #[arg(long = "folder", visible_alias = "in", value_name = "CARPETA")]
         parent: Option<String>,
+        /// Trata el nombre como literal: no interpreta `/` ni `\` como separadores
+        #[arg(long)]
+        literal: bool,
     },
     /// Sincroniza un directorio local con una carpeta de Drive
     Sync {
@@ -232,7 +236,11 @@ fn run(global: &Global, command: Command) -> Result<()> {
                     dest,
                     overwrite,
                 } => cmd_download(global, &client, remote, dest, overwrite),
-                Command::Mkdir { name, parent } => cmd_mkdir(global, &client, name, parent),
+                Command::Mkdir {
+                    name,
+                    parent,
+                    literal,
+                } => cmd_mkdir(global, &client, name, parent, literal),
                 Command::Sync {
                     path,
                     remote,
@@ -862,23 +870,72 @@ fn cmd_mkdir(
     client: &DriveClient,
     name: String,
     parent: Option<String>,
+    literal: bool,
 ) -> Result<()> {
-    if name.contains('/') {
-        bail!("el nombre no puede contener '/'");
-    }
-    let parent = match parent {
+    // Primero se crea (o localiza) el contenedor indicado con --folder.
+    let base = match parent {
         Some(reference) => client.resolve_ref(&reference)?,
         None => client.root(),
     };
-    if !parent.is_folder() {
-        bail!("'{}' no es una carpeta", parent.name);
+    if !base.is_folder() {
+        bail!("'{}' no es una carpeta", base.name);
     }
-    if global.dry_run {
-        println!("haría[crear-carpeta] {}/", name);
-        return Ok(());
+
+    // El nombre puede traer la ruta completa: `Recomp/NSW 2` o `Recomp\NSW 2`.
+    let parts = if literal {
+        if name.contains('/') {
+            bail!(
+                "Drive no permite '/' en el nombre de una carpeta; \
+                 quita --literal para crear subcarpetas con 'Recomp/NSW 2'"
+            );
+        }
+        vec![name.trim().to_string()]
+    } else {
+        util::split_folder_path(&name)?
+    };
+    if parts.len() == 1 && parts[0].is_empty() {
+        bail!("el nombre de la carpeta no puede estar vacío");
     }
-    let folder = client.create_folder(&name, &parent.id)?;
-    println!("Carpeta creada: {}/ — {}", folder.name, folder.id);
+
+    // Recorre los componentes creando los que falten (semántica de `mkdir -p`).
+    let mut current = base.clone();
+    let mut recorrido: Vec<String> = Vec::new();
+
+    for part in &parts {
+        recorrido.push(part.clone());
+        let ruta = recorrido.join("/");
+
+        match client.find_child(&current.id, part)? {
+            Some(existing) if existing.is_folder() => current = existing,
+            Some(_) => bail!(
+                "ya existe un archivo llamado '{}' en '{}'; no se puede usar como carpeta",
+                part,
+                if recorrido.len() == 1 {
+                    base.name.clone()
+                } else {
+                    recorrido[..recorrido.len() - 1].join("/")
+                }
+            ),
+            None => {
+                if global.dry_run {
+                    println!("haría[crear-carpeta] {ruta}/");
+                    // Sin ID real no se puede seguir bajando: se anota el resto.
+                    for resto in &parts[recorrido.len()..] {
+                        recorrido.push(resto.clone());
+                        println!("haría[crear-carpeta] {}/", recorrido.join("/"));
+                    }
+                    return Ok(());
+                }
+                let creada = client.create_folder(part, &current.id)?;
+                println!("Carpeta creada: {ruta}/ — {}", creada.id);
+                current = creada;
+            }
+        }
+    }
+
+    if !global.quiet {
+        println!("Listo: {}/ dentro de '{}'", recorrido.join("/"), base.name);
+    }
     Ok(())
 }
 
