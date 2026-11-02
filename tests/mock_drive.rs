@@ -1983,6 +1983,130 @@ fn list_avisa_de_documentos_de_google_sin_tamano() {
     );
 }
 
+/// Mantiene el cerrojo de `.drivesync/lock` desde otro proceso (python + flock).
+struct LockHolder {
+    child: std::process::Child,
+}
+
+impl LockHolder {
+    fn start(root: &Path, seconds: u64) -> Self {
+        let lock = root.join(".drivesync").join("lock");
+        fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        let marker = root.join("lock-tomado");
+        let script = format!(
+            "import fcntl, os, sys, time\n\
+             f = open({lock:?}, 'w')\n\
+             f.write('pid=%d\\nhost=prueba\\niniciado=%d\\n' % (os.getpid(), int(time.time())))\n\
+             f.flush()\n\
+             fcntl.flock(f, fcntl.LOCK_EX)\n\
+             open({marker:?}, 'w').write('locked')\n\
+             time.sleep({seconds})\n"
+        );
+        let child = Command::new("python3")
+            .arg("-c")
+            .arg(script)
+            .spawn()
+            .expect("no se pudo lanzar el titular del cerrojo");
+        let holder = Self { child };
+
+        // Espera a que el cerrojo esté realmente tomado.
+        for _ in 0..100 {
+            if marker.exists() {
+                return holder;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!("el titular del cerrojo no llegó a tomarlo");
+    }
+}
+
+impl Drop for LockHolder {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn sync_no_corre_si_otro_proceso_tiene_el_cerrojo() {
+    let mock = MockDrive::start();
+    let work = tempfile::tempdir().unwrap();
+    let config = config_path(work.path());
+    let local = work.path().join("local");
+    fs::create_dir_all(&local).unwrap();
+    fs::write(local.join("a.txt"), b"hola").unwrap();
+    mock.add_folder("Backup", "root");
+
+    let _holder = LockHolder::start(&local, 30);
+
+    let output = run_cli(
+        mock.base(),
+        &config,
+        &["sync", local.to_str().unwrap(), "--remote", "Backup"],
+    );
+    assert!(!output.status.success(), "debe negarse a correr");
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("otra sincronización"), "{err}");
+    assert!(err.contains("pid"), "debe identificar al titular: {err}");
+
+    // Y no debe haber tocado nada.
+    assert!(
+        mock.content_by_name("a.txt").is_none(),
+        "no debe subir nada"
+    );
+    assert!(
+        !local.join(".drivesync").join("state.json").exists(),
+        "no debe escribir estado"
+    );
+}
+
+#[test]
+fn sync_funciona_cuando_el_cerrojo_queda_libre() {
+    let mock = MockDrive::start();
+    let work = tempfile::tempdir().unwrap();
+    let config = config_path(work.path());
+    let local = work.path().join("local");
+    fs::create_dir_all(&local).unwrap();
+    fs::write(local.join("a.txt"), b"hola").unwrap();
+    mock.add_folder("Backup", "root");
+
+    {
+        // Un proceso toma el cerrojo y termina: el kernel lo libera solo.
+        let _holder = LockHolder::start(&local, 0);
+        thread::sleep(Duration::from_millis(300));
+    }
+    // El archivo del cerrojo queda en disco, pero ya no bloquea.
+    assert!(local.join(".drivesync").join("lock").exists());
+
+    let output = run_cli(
+        mock.base(),
+        &config,
+        &["sync", local.to_str().unwrap(), "--remote", "Backup"],
+    );
+    assert_ok(&output);
+    assert_eq!(mock.content_by_name("a.txt").as_deref(), Some(&b"hola"[..]));
+}
+
+#[test]
+fn dos_syncs_seguidos_sobre_el_mismo_directorio_funcionan() {
+    let mock = MockDrive::start();
+    let work = tempfile::tempdir().unwrap();
+    let config = config_path(work.path());
+    let local = work.path().join("local");
+    fs::create_dir_all(&local).unwrap();
+    fs::write(local.join("a.txt"), b"hola").unwrap();
+    mock.add_folder("Backup", "root");
+
+    for _ in 0..2 {
+        let output = run_cli(
+            mock.base(),
+            &config,
+            &["sync", local.to_str().unwrap(), "--remote", "Backup"],
+        );
+        assert_ok(&output);
+    }
+}
+
 #[test]
 fn guarda_el_token_y_consulta_la_cuenta() {
     let mock = MockDrive::start();

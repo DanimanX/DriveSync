@@ -235,11 +235,12 @@ dependencies = [
 
 [[package]]
 name = "drivesync"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
  "dirs",
+ "libc",
  "md-5",
  "percent-encoding",
  "reqwest",

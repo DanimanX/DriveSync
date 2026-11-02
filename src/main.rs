@@ -3,6 +3,7 @@
 mod api;
 mod auth;
 mod config;
+mod lock;
 mod sync;
 mod util;
 
@@ -1200,6 +1201,22 @@ fn cmd_sync(
     if !root.is_dir() {
         bail!("{} no es un directorio", root.display());
     }
+
+    // Antes de leer o escribir nada: una sola sincronización por directorio.
+    // El cerrojo cubre también el escaneo, para que dos procesos no se pisen
+    // entre el escaneo y la escritura del estado.
+    let _lock = lock::SyncLock::acquire(&root, !global.dry_run)?;
+    if global.verbose {
+        match _lock.holder() {
+            Some(holder) => println!(
+                "[bloqueo] adquirido {} ({})",
+                _lock.path_ref().display(),
+                holder.describe()
+            ),
+            None => println!("[bloqueo] no hay cerrojo previo (simulación)"),
+        }
+    }
+
     let reference = match remote {
         Some(reference) => reference,
         None => client

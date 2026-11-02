@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/DanimanX/DriveSync/actions/workflows/ci.yml/badge.svg)](https://github.com/DanimanX/DriveSync/actions/workflows/ci.yml)
 
-Versión 0.3.2 · CLI en Rust para sincronizar archivos y carpetas con Google Drive usando un
+Versión 0.4.0 · CLI en Rust para sincronizar archivos y carpetas con Google Drive usando un
 token de Google. Sin SDKs pesados: habla directamente con la API v3 de Drive
 sobre HTTPS, guarda el estado de la sincronización y resuelve conflictos sin
 perder ninguna versión.
@@ -46,7 +46,7 @@ Cada tag publica una release con los binarios de `x86_64` y `aarch64` en
 <https://github.com/DanimanX/DriveSync/releases>.
 
 ```bash
-tag=v0.3.2
+tag=v0.4.0
 arch=x86_64-unknown-linux-gnu        # o aarch64-unknown-linux-gnu
 base="https://github.com/DanimanX/DriveSync/releases/download/$tag"
 
@@ -408,6 +408,24 @@ base y a todo el subárbol (`cache/**`), tanto en local como en remoto (así
 `--delete` no borra en Drive algo que estás excluyendo). `.drivesync` se excluye
 siempre. Los enlaces simbólicos se omiten con un aviso.
 
+### Una sola sincronización por directorio
+
+`sync` toma un cerrojo exclusivo sobre `DIRECTORIO/.drivesync/lock` antes de
+leer o escribir nada. Si ya hay otra ejecución trabajando ahí, la segunda sale
+de inmediato sin tocar archivos ni estado:
+
+```
+error: ya hay otra sincronización en curso sobre este directorio (pid 48213, hace 2 min, en mi-pc).
+Espera a que termine: el bloqueo se libera solo al acabar ese proceso.
+Si crees que no hay ninguno, compruébalo con: ps aux | grep drivesync
+```
+
+El cerrojo es un `flock` del kernel, no un archivo de PID: si el proceso muere
+—incluido `kill -9` o un corte de luz— el bloqueo desaparece con él y no hay
+que borrar nada a mano. El archivo puede quedarse en disco; su presencia no
+bloquea, solo el cerrojo lo hace. El bloqueo cubre el escaneo, el plan y la
+escritura del estado, así que dos procesos nunca se pisan entre medias.
+
 ## Limitaciones conocidas
 
 - Los **documentos nativos de Google** (Docs, Sheets, Slides) no tienen MD5 ni
@@ -422,7 +440,9 @@ siempre. Los enlaces simbólicos se omiten con un aviso.
   misma ejecución.
 - Nombres remotos con `/` se sanean a `_`; nombres duplicados en la misma
   carpeta remota se resuelven usando el primero y avisando.
-- No ejecutes dos `drivesync sync` sobre el mismo directorio a la vez.
+- El bloqueo impide dos `sync` simultáneos sobre el mismo directorio, pero no
+  coordina procesos que apunten a la misma carpeta de Drive desde directorios
+  locales distintos.
 
 ## Seguridad
 
