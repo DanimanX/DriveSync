@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 
@@ -545,8 +545,44 @@ fn respond(stream: &mut TcpStream, title: &str, message: &str) -> Result<()> {
     Ok(())
 }
 
+/// Caracteres a escapar dentro de un valor de query (RFC 3986).
+///
+/// Se dejan intactos los *unreserved*: `A-Z a-z 0-9 - . _ ~` y `!`, que es
+/// `sub-delim` válido en una query. Escapar `-` o `.` rompe el `client_id`:
+/// Google no lo decodifica y responde `invalid_client` ("The OAuth client was
+/// not found").
+const QUERY_VALUE: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'$')
+    .add(b'%')
+    .add(b'&')
+    .add(b'\'')
+    .add(b'(')
+    .add(b')')
+    .add(b'*')
+    .add(b'+')
+    .add(b',')
+    .add(b'/')
+    .add(b':')
+    .add(b';')
+    .add(b'<')
+    .add(b'=')
+    .add(b'>')
+    .add(b'?')
+    .add(b'@')
+    .add(b'[')
+    .add(b'\\')
+    .add(b']')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
+
 fn encode(value: &str) -> String {
-    utf8_percent_encode(value, NON_ALPHANUMERIC).to_string()
+    utf8_percent_encode(value, QUERY_VALUE).to_string()
 }
 
 fn open_browser(url: &str) -> Result<()> {
@@ -638,6 +674,31 @@ mod tests {
     }
 
     #[test]
+    fn no_escapa_caracteres_unreserved_del_client_id() {
+        // Google no decodifica el client_id: escapar `-` o `.` da invalid_client.
+        let client_id = "123456789012-abcdefghijklmnop.apps.googleusercontent.com";
+        assert_eq!(encode(client_id), client_id);
+        assert_eq!(encode("a-b_c.d~e"), "a-b_c.d~e");
+
+        let url = authorization_url(client_id, "http://127.0.0.1:8765/callback", "s", "st");
+        assert!(
+            url.contains(&format!("client_id={client_id}&")),
+            "el client_id debe ir literal: {url}"
+        );
+        assert!(!url.contains("%2E"), "no debe escapar puntos: {url}");
+        assert!(!url.contains("%2D"), "no debe escapar guiones: {url}");
+    }
+
+    #[test]
+    fn escapa_solo_lo_que_rompe_la_query() {
+        assert_eq!(encode("a b"), "a%20b");
+        assert_eq!(encode("a&b=c"), "a%26b%3Dc");
+        assert_eq!(encode("a#b"), "a%23b");
+        assert_eq!(encode("a+b"), "a%2Bb");
+        assert_eq!(encode("ñ"), "%C3%B1");
+    }
+
+    #[test]
     fn url_de_autorizacion_escapa_parametros() {
         let url = authorization_url(
             "id.apps.googleusercontent.com",
@@ -646,6 +707,10 @@ mod tests {
             "estado-1",
         );
         assert!(url.starts_with("https://accounts.google.com/o/oauth2/v2/auth?"));
+        assert!(
+            url.contains("client_id=id.apps.googleusercontent.com"),
+            "el client_id debe ir literal: {url}"
+        );
         assert!(url.contains("access_type=offline"));
         assert!(url.contains("prompt=consent"));
         // Se decodifica para comprobar el valor, no la forma exacta del escape.

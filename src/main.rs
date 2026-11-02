@@ -325,6 +325,15 @@ fn cmd_auth(global: &Global, args: AuthArgs) -> Result<()> {
         .or(config.client_secret.clone())
         .context(faltan_credenciales())?;
 
+    if !global.quiet && !client_id.ends_with(".apps.googleusercontent.com") {
+        eprintln!(
+            "[aviso] el client_id no termina en .apps.googleusercontent.com: los clientes \
+             de Android/iOS o de cuenta de servicio no sirven aquí. Si Google responde \
+             \"invalid_client\", revisa que copiaste el ID completo del cliente de tipo \
+             \"Aplicación de escritorio\"."
+        );
+    }
+
     let mut fresh = if manual {
         let redirect = redirect_uri
             .clone()

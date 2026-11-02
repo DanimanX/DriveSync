@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/DanimanX/DriveSync/actions/workflows/ci.yml/badge.svg)](https://github.com/DanimanX/DriveSync/actions/workflows/ci.yml)
 
-Versión 0.1.0 · CLI en Rust para sincronizar archivos y carpetas con Google Drive usando un
+Versión 0.1.1 · CLI en Rust para sincronizar archivos y carpetas con Google Drive usando un
 token de Google. Sin SDKs pesados: habla directamente con la API v3 de Drive
 sobre HTTPS, guarda el estado de la sincronización y resuelve conflictos sin
 perder ninguna versión.
@@ -42,7 +42,7 @@ Cada tag publica una release con los binarios de `x86_64` y `aarch64` en
 <https://github.com/DanimanX/DriveSync/releases>.
 
 ```bash
-tag=v0.1.0
+tag=v0.1.1
 arch=x86_64-unknown-linux-gnu        # o aarch64-unknown-linux-gnu
 base="https://github.com/DanimanX/DriveSync/releases/download/$tag"
 
@@ -171,6 +171,44 @@ Se valida contra Google antes de guardarlo.
 `drivesync status` muestra la cuenta, el alcance, el modo de autenticación y el
 almacenamiento usado. `drivesync logout` borra los tokens y conserva el client
 ID/secret.
+
+## Problemas frecuentes
+
+**`Error 401: invalid_client` — "The OAuth client was not found"**
+
+La página de Google aparece, pero no reconoce el cliente. Casi siempre es una
+de estas:
+
+1. El `client_id` no está completo o tiene un espacio/retorno de carro al
+   pegar. Debe terminar en `.apps.googleusercontent.com` y medir ~72 caracteres.
+2. El cliente es de tipo **Android**, **iOS** o **cuenta de servicio**: solo los
+   clientes de tipo **Aplicación de escritorio** o **Aplicación web** sirven
+   para este flujo. Compruébalo en *Credenciales* del proyecto.
+3. El cliente se creó en otro proyecto del que crees, o se borró.
+
+DriveSync avisa si el `client_id` no termina en `.apps.googleusercontent.com`.
+Verifica el valor guardado con:
+
+```bash
+drivesync status          # no muestra el secreto
+python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.config/drivesync/config.json')))['client_id'])"
+```
+
+**`redirect_uri_mismatch`**
+
+La URI de redirección no está autorizada en el cliente. Añade
+`http://127.0.0.1:8765/callback` en *URI de redirección autorizados*, o usa el
+mismo `--port` / `--redirect-uri` que tengas registrado.
+
+**`access_denied`**
+
+La app está en modo prueba y tu cuenta no está en la lista de *usuarios de
+prueba* de la pantalla de consentimiento.
+
+**`invalid_grant`**
+
+El código ya se canjeó, caducó (10 minutos) o el `refresh_token` se revocó.
+Vuelve a ejecutar `drivesync auth`.
 
 ## Comandos
 
