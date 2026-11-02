@@ -21,6 +21,7 @@ use crate::sync::{ConflictPolicy, Direction, SyncOptions};
 const EJEMPLOS: &str = "\
 Ejemplos:
   drivesync auth --client-id ID.apps.googleusercontent.com --client-secret SECRET
+  drivesync auth --manual --client-id ID --client-secret SECRET
   drivesync auth --access-token \"$(gcloud auth print-access-token)\"
   drivesync list --folder Backup
   drivesync sync ./documentos --remote Backup/Documentos
@@ -88,6 +89,15 @@ struct AuthArgs {
     /// No intenta abrir el navegador
     #[arg(long)]
     no_browser: bool,
+    /// No abre un servidor local: muestra la URL y pide el código o el token a mano
+    #[arg(long)]
+    manual: bool,
+    /// URI de redirección que se incrusta en la URL (por defecto http://127.0.0.1:<puerto>/callback)
+    #[arg(long, value_name = "URI")]
+    redirect_uri: Option<String>,
+    /// Valor de state a exigir en la respuesta (por defecto se genera uno)
+    #[arg(long, value_name = "VALOR")]
+    state: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -253,6 +263,9 @@ fn cmd_auth(global: &Global, args: AuthArgs) -> Result<()> {
         scope,
         port,
         no_browser,
+        manual,
+        redirect_uri,
+        state,
     } = args;
     let (mut config, path) = config::load_config(global.config.as_deref())?;
     config::apply_env(&mut config);
@@ -312,14 +325,27 @@ fn cmd_auth(global: &Global, args: AuthArgs) -> Result<()> {
         .or(config.client_secret.clone())
         .context(faltan_credenciales())?;
 
-    let options = AuthOptions {
-        client_id,
-        client_secret,
-        scope,
-        port,
-        open_browser: !no_browser,
+    let mut fresh = if manual {
+        let redirect = redirect_uri
+            .clone()
+            .unwrap_or_else(|| format!("http://127.0.0.1:{port}/callback"));
+        auth::run_manual(&auth::ManualOptions {
+            client_id,
+            client_secret,
+            scope,
+            redirect_uri: redirect,
+            state,
+        })?
+    } else {
+        auth::run_loopback(&AuthOptions {
+            client_id,
+            client_secret,
+            scope,
+            port,
+            open_browser: !no_browser,
+        })?
     };
-    let mut fresh = auth::run_loopback(&options)?;
+
     fresh.default_remote = config.default_remote.clone();
     config::save_config(&fresh, &path)?;
     println!("Credenciales guardadas en {}", path.display());

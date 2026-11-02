@@ -202,6 +202,17 @@ pub struct AuthOptions {
     pub open_browser: bool,
 }
 
+/// Compone la URL de consentimiento de Google.
+pub fn authorization_url(client_id: &str, redirect_uri: &str, scope: &str, state: &str) -> String {
+    format!(
+        "{AUTH_URL}?client_id={}&redirect_uri={}&response_type=code&scope={}&access_type=offline&prompt=consent&state={}",
+        encode(client_id),
+        encode(redirect_uri),
+        encode(scope),
+        encode(state),
+    )
+}
+
 /// Flujo OAuth de aplicación instalada con redirección a 127.0.0.1.
 pub fn run_loopback(options: &AuthOptions) -> Result<Config> {
     let listener = TcpListener::bind(("127.0.0.1", options.port)).with_context(|| {
@@ -213,14 +224,7 @@ pub fn run_loopback(options: &AuthOptions) -> Result<Config> {
     let port = listener.local_addr()?.port();
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
     let state = util::unique_id();
-
-    let auth_url = format!(
-        "{AUTH_URL}?client_id={}&redirect_uri={}&response_type=code&scope={}&access_type=offline&prompt=consent&state={}",
-        encode(&options.client_id),
-        encode(&redirect_uri),
-        encode(&options.scope),
-        encode(&state),
-    );
+    let auth_url = authorization_url(&options.client_id, &redirect_uri, &options.scope, &state);
 
     println!("Autoriza el acceso abriendo esta URL:\n\n  {auth_url}\n");
     if options.open_browser {
@@ -231,12 +235,187 @@ pub fn run_loopback(options: &AuthOptions) -> Result<Config> {
     println!("Esperando la redirección a {redirect_uri} (5 minutos máximo)...");
 
     let code = wait_for_code(&listener, &state, Duration::from_secs(300))?;
+    exchange_code(
+        &options.client_id,
+        &options.client_secret,
+        &code,
+        &redirect_uri,
+        &options.scope,
+    )
+}
+
+/// Lo que el usuario pega cuando el flujo se hace fuera de banda.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManualGrant {
+    /// Código de autorización (suelto o dentro de la URL de redirección).
+    Code(String),
+    /// Token de acceso ya emitido (empieza por `ya29.`).
+    AccessToken(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct ManualInput {
+    pub grant: ManualGrant,
+    /// Parámetro `state` si venía en una URL de redirección.
+    pub state: Option<String>,
+}
+
+/// Interpreta lo que el usuario pegó: URL de redirección, código o token.
+pub fn parse_manual_input(input: &str) -> Result<ManualInput> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        bail!("no se recibió nada; pega la URL de redirección o el código de autorización");
+    }
+
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        let query = trimmed
+            .split_once('?')
+            .map(|(_, query)| query)
+            .unwrap_or("");
+        let params = parse_query(query);
+
+        if let Some(error) = params.get("error") {
+            let detail = params
+                .get("error_description")
+                .map(String::as_str)
+                .unwrap_or("");
+            bail!(
+                "Google rechazó la autorización: {error}{}",
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {detail}")
+                }
+            );
+        }
+
+        let Some(code) = params.get("code").filter(|code| !code.is_empty()) else {
+            bail!(
+                "la URL pegada no contiene el parámetro code=...; \
+                 copia la barra de direcciones completa tras autorizar"
+            );
+        };
+
+        return Ok(ManualInput {
+            grant: ManualGrant::Code(code.clone()),
+            state: params.get("state").cloned(),
+        });
+    }
+
+    if trimmed.starts_with("ya29.") {
+        return Ok(ManualInput {
+            grant: ManualGrant::AccessToken(trimmed.to_string()),
+            state: None,
+        });
+    }
+
+    Ok(ManualInput {
+        grant: ManualGrant::Code(trimmed.to_string()),
+        state: None,
+    })
+}
+
+pub struct ManualOptions {
+    pub client_id: String,
+    pub client_secret: String,
+    pub scope: String,
+    pub redirect_uri: String,
+    /// Valor de `state` a exigir. Si es `None` se genera uno por ejecución.
+    pub state: Option<String>,
+}
+
+/// Flujo OAuth sin servidor local: se muestra la URL y se pide el resultado
+/// por teclado. Sirve en máquinas sin navegador o por SSH.
+pub fn run_manual(options: &ManualOptions) -> Result<Config> {
+    let state = options
+        .state
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(util::unique_id);
+    let auth_url = authorization_url(
+        &options.client_id,
+        &options.redirect_uri,
+        &options.scope,
+        &state,
+    );
+
+    println!("1. Abre esta URL en cualquier navegador (puede ser otro equipo):\n");
+    println!("   {auth_url}\n");
+    println!(
+        "2. Autoriza la aplicación. El navegador intentará ir a {}\n   y mostrará un error de conexión: es lo esperado.",
+        options.redirect_uri
+    );
+    println!("3. Copia la URL completa de la barra de direcciones (contiene code=...) o pega un token de acceso.\n");
+
+    print!("Pega la URL, el código o el token: ");
+    std::io::stdout().flush().ok();
+    let raw = read_input_line()?;
+    let parsed = parse_manual_input(&raw)?;
+
+    match &parsed.state {
+        Some(pasted) if pasted == &state => {}
+        Some(pasted) => bail!(
+            "el parámetro state no coincide (se esperaba {state} y llegó {pasted}); \
+             la respuesta no corresponde a esta sesión"
+        ),
+        None => eprintln!(
+            "[aviso] no se pudo comprobar el parámetro state; asegúrate de haber pegado \
+             una URL de esta misma ejecución"
+        ),
+    }
+
+    match parsed.grant {
+        ManualGrant::AccessToken(token) => {
+            eprintln!(
+                "[aviso] has pegado un token de acceso: caduca en ~1 hora y no se renueva solo."
+            );
+            Ok(Config {
+                client_id: Some(options.client_id.clone()),
+                client_secret: Some(options.client_secret.clone()),
+                access_token: Some(token),
+                access_token_expiry: None,
+                scope: Some(options.scope.clone()),
+                ..Default::default()
+            })
+        }
+        ManualGrant::Code(code) => exchange_code(
+            &options.client_id,
+            &options.client_secret,
+            &code,
+            &options.redirect_uri,
+            &options.scope,
+        ),
+    }
+}
+
+fn read_input_line() -> Result<String> {
+    use std::io::BufRead;
+    let mut line = String::new();
+    let read = std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .context("no se pudo leer la entrada estándar")?;
+    if read == 0 {
+        bail!(
+            "la entrada estándar se cerró sin datos; vuelve a ejecutar `drivesync auth --manual`"
+        );
+    }
+    Ok(line)
+}
+
+fn exchange_code(
+    client_id: &str,
+    client_secret: &str,
+    code: &str,
+    redirect_uri: &str,
+    scope: &str,
+) -> Result<Config> {
     let tokens = post_token(&[
-        ("client_id", options.client_id.clone()),
-        ("client_secret", options.client_secret.clone()),
-        ("code", code),
+        ("client_id", client_id.to_string()),
+        ("client_secret", client_secret.to_string()),
+        ("code", code.to_string()),
         ("grant_type", "authorization_code".to_string()),
-        ("redirect_uri", redirect_uri),
+        ("redirect_uri", redirect_uri.to_string()),
     ])?;
 
     if tokens.refresh_token.is_none() {
@@ -247,12 +426,12 @@ pub fn run_loopback(options: &AuthOptions) -> Result<Config> {
     }
 
     Ok(Config {
-        client_id: Some(options.client_id.clone()),
-        client_secret: Some(options.client_secret.clone()),
+        client_id: Some(client_id.to_string()),
+        client_secret: Some(client_secret.to_string()),
         refresh_token: tokens.refresh_token,
         access_token: Some(tokens.access_token),
         access_token_expiry: Some(util::now_unix() + tokens.expires_in.unwrap_or(3600) - 60),
-        scope: tokens.scope.or_else(|| Some(options.scope.clone())),
+        scope: tokens.scope.or_else(|| Some(scope.to_string())),
         default_remote: None,
     })
 }
@@ -412,6 +591,80 @@ mod tests {
     fn separa_path_y_query() {
         assert_eq!(split_target("/callback?code=x"), ("/callback", "code=x"));
         assert_eq!(split_target("/favicon.ico"), ("/favicon.ico", ""));
+    }
+
+    #[test]
+    fn interpreta_url_de_redireccion() {
+        let input = "http://127.0.0.1:8765/callback?state=abc&code=4%2F0AX&scope=x";
+        let parsed = parse_manual_input(input).unwrap();
+        assert_eq!(parsed.grant, ManualGrant::Code("4/0AX".to_string()));
+        assert_eq!(parsed.state.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn interpreta_codigo_suelto() {
+        let parsed = parse_manual_input("  4/0AXcodigo  \n").unwrap();
+        assert_eq!(parsed.grant, ManualGrant::Code("4/0AXcodigo".to_string()));
+        assert!(parsed.state.is_none());
+    }
+
+    #[test]
+    fn interpreta_token_de_acceso() {
+        let parsed = parse_manual_input("ya29.a0AfH6SMBx").unwrap();
+        assert_eq!(
+            parsed.grant,
+            ManualGrant::AccessToken("ya29.a0AfH6SMBx".to_string())
+        );
+    }
+
+    #[test]
+    fn rechaza_url_sin_codigo() {
+        let error = parse_manual_input("http://127.0.0.1:8765/callback?state=abc").unwrap_err();
+        assert!(format!("{error:#}").contains("code="));
+    }
+
+    #[test]
+    fn reporta_error_oauth_de_la_url() {
+        let input = "http://127.0.0.1:8765/callback?error=access_denied&error_description=El+usuario+rechaz\u{f3}";
+        let error = parse_manual_input(input).unwrap_err();
+        let texto = format!("{error:#}");
+        assert!(texto.contains("access_denied"), "{texto}");
+        assert!(texto.contains("rechaz"), "{texto}");
+    }
+
+    #[test]
+    fn rechaza_entrada_vacia() {
+        assert!(parse_manual_input("   \n").is_err());
+    }
+
+    #[test]
+    fn url_de_autorizacion_escapa_parametros() {
+        let url = authorization_url(
+            "id.apps.googleusercontent.com",
+            "http://127.0.0.1:8765/callback",
+            "https://www.googleapis.com/auth/drive",
+            "estado-1",
+        );
+        assert!(url.starts_with("https://accounts.google.com/o/oauth2/v2/auth?"));
+        assert!(url.contains("access_type=offline"));
+        assert!(url.contains("prompt=consent"));
+        // Se decodifica para comprobar el valor, no la forma exacta del escape.
+        let decoded = percent_encoding::percent_decode_str(&url)
+            .decode_utf8_lossy()
+            .into_owned();
+        assert!(
+            decoded.contains("redirect_uri=http://127.0.0.1:8765/callback"),
+            "{decoded}"
+        );
+        assert!(
+            decoded.contains("scope=https://www.googleapis.com/auth/drive"),
+            "{decoded}"
+        );
+        assert!(decoded.contains("state=estado-1"), "{decoded}");
+        assert!(
+            !url.contains(" "),
+            "no debe haber espacios sin escapar: {url}"
+        );
     }
 
     #[test]

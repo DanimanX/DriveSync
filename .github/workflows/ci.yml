@@ -139,20 +139,25 @@ jobs:
 
       - name: Escribir notas de la release
         run: |
-          cat > notas.md <<'FIN'
-          Binarios de drivesync para Linux (x86_64 y aarch64).
-
-          Descarga el de tu arquitectura, dale permisos de ejecución y comprueba la versión:
-
-          ```bash
-          chmod +x drivesync-*-x86_64-unknown-linux-gnu
-          ./drivesync-*-x86_64-unknown-linux-gnu --version
-          ```
-
-          Verifica la integridad con el `SHA256SUMS-<target>.txt` correspondiente.
-
-          Compilado desde el tag por GitHub Actions.
-          FIN
+          set -euo pipefail
+          ver=$(ls dist | sed -n 's/^drivesync-\(.*\)-x86_64-unknown-linux-gnu$/\1/p' | head -1)
+          [ -n "$ver" ] || { echo "no se pudo deducir la versión de los artefactos"; exit 1; }
+          echo "VERSION=$ver" >> "$GITHUB_ENV"
+          {
+            echo "Binarios de drivesync $ver para Linux (x86_64 y aarch64)."
+            echo
+            echo 'Descarga el de tu arquitectura, dale permisos de ejecución y comprueba la versión:'
+            echo
+            echo '```bash'
+            echo "chmod +x drivesync-$ver-x86_64-unknown-linux-gnu"
+            echo "./drivesync-$ver-x86_64-unknown-linux-gnu --version"
+            echo '```'
+            echo
+            echo 'Verifica la integridad con el archivo `SHA256SUMS-<target>.txt` correspondiente.'
+            echo
+            echo 'Compilado desde el tag por GitHub Actions.'
+          } > notas.md
+          cat notas.md
 
       - name: Crear o actualizar release
         env:

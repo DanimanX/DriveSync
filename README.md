@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/DanimanX/DriveSync/actions/workflows/ci.yml/badge.svg)](https://github.com/DanimanX/DriveSync/actions/workflows/ci.yml)
 
-Versión 0.0.1 · CLI en Rust para sincronizar archivos y carpetas con Google Drive usando un
+Versión 0.1.0 · CLI en Rust para sincronizar archivos y carpetas con Google Drive usando un
 token de Google. Sin SDKs pesados: habla directamente con la API v3 de Drive
 sobre HTTPS, guarda el estado de la sincronización y resuelve conflictos sin
 perder ninguna versión.
@@ -14,8 +14,9 @@ drivesync sync ./documentos --remote Backup/Documentos
 
 ## Características
 
-- **Autenticación por token**: token de acceso directo, refresh token o flujo
-  OAuth de escritorio con redirección a `127.0.0.1`.
+- **Autenticación por token**: token de acceso directo, refresh token, flujo
+  OAuth de escritorio con redirección a `127.0.0.1` o flujo manual
+  (`--manual`: imprime la URL y pide el código o el token a mano).
 - **Sincronización en tres vías** con un archivo de estado local: distingue
   "cambió en local", "cambió en remoto" y "borrado" en cada lado.
 - **Subidas reanudables por bloques** (8 MiB) para archivos grandes.
@@ -41,7 +42,7 @@ Cada tag publica una release con los binarios de `x86_64` y `aarch64` en
 <https://github.com/DanimanX/DriveSync/releases>.
 
 ```bash
-tag=v0.0.1
+tag=v0.1.0
 arch=x86_64-unknown-linux-gnu        # o aarch64-unknown-linux-gnu
 base="https://github.com/DanimanX/DriveSync/releases/download/$tag"
 
@@ -111,7 +112,44 @@ sin escritorio. Si Google rechaza la redirección, añade
 `http://127.0.0.1:8765/callback` en los *URI de redirección autorizados* del
 cliente OAuth.
 
-### 3. Refresh token ya emitido
+### 3. Sin servidor local: la URL y el código a mano (`--manual`)
+
+Para máquinas sin navegador, sesiones SSH o cuando el puerto local está
+bloqueado. DriveSync imprime la URL de consentimiento, tú autorizas en
+cualquier navegador (puede ser otro equipo) y pegas el resultado:
+
+```bash
+drivesync auth --manual --client-id ID --client-secret SECRET
+```
+
+```
+1. Abre esta URL en cualquier navegador (puede ser otro equipo):
+
+   https://accounts.google.com/o/oauth2/v2/auth?client_id=...&redirect_uri=...
+
+2. Autoriza la aplicación. El navegador intentará ir a http://127.0.0.1:8765/callback
+   y mostrará un error de conexión: es lo esperado.
+3. Copia la URL completa de la barra de direcciones (contiene code=...) o pega un token de acceso.
+
+Pega la URL, el código o el token:
+```
+
+Qué acepta el prompt:
+
+- La **URL de redirección completa** (`http://127.0.0.1:8765/callback?state=…&code=…`).
+- El **código suelto** (`4/0AX…`).
+- Un **token de acceso** ya emitido (`ya29.…`), que se guarda tal cual con el
+  aviso de que caduca en ~1 hora y no se renueva.
+
+La respuesta se valida contra el `state` de esa ejecución; si no coincide, se
+rechaza el canje. Usa `--redirect-uri` para incrustar otra URI (debe estar
+autorizada en el cliente OAuth) y `--state VALOR` para fijar el valor, útil en
+scripts.
+
+En el caso del código se obtiene un refresh token igual que en el flujo con
+navegador, así que el token se renueva después solo.
+
+### 4. Refresh token ya emitido
 
 ```bash
 drivesync auth --client-id ID --client-secret SECRET --refresh-token REFRESH

@@ -704,6 +704,22 @@ fn run_cli_without_token(base: &str, config: &Path, args: &[&str]) -> Output {
     run_cli_inner(base, config, args, None)
 }
 
+fn run_cli_with_stdin(base: &str, config: &Path, args: &[&str], stdin: &str) -> Output {
+    use std::process::Stdio;
+    let mut child = command_for(base, config, None)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("no se pudo ejecutar drivesync");
+    {
+        let mut pipe = child.stdin.take().expect("stdin");
+        pipe.write_all(stdin.as_bytes()).expect("escribir stdin");
+    }
+    child.wait_with_output().expect("esperar drivesync")
+}
+
 fn run_cli_in(base: &str, config: &Path, cwd: &Path, args: &[&str]) -> Output {
     let mut command = command_for(base, config, Some("token-de-prueba"));
     command
@@ -1064,6 +1080,122 @@ fn renueva_el_token_con_refresh_token() {
 
     let refreshed: Value = serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
     assert_eq!(refreshed["access_token"], "token-renovado");
+}
+
+#[test]
+fn auth_manual_canjea_la_url_pegada() {
+    let mock = MockDrive::start();
+    let work = tempfile::tempdir().unwrap();
+    let config = config_path(work.path());
+    let args = [
+        "auth",
+        "--manual",
+        "--client-id",
+        "cid",
+        "--client-secret",
+        "sec",
+        "--state",
+        "estado-fijo",
+        "--quiet",
+    ];
+
+    // Sin entrada: muestra la URL y falla sin guardar nada.
+    let sin_entrada = run_cli_with_stdin(mock.base(), &config, &args, "");
+    assert!(!sin_entrada.status.success());
+    assert!(!config.exists(), "no debe guardar nada si no hay entrada");
+    let out = stdout(&sin_entrada);
+    assert!(
+        out.contains("accounts.google.com/o/oauth2/v2/auth"),
+        "{out}"
+    );
+    assert!(out.contains("access_type=offline"), "{out}");
+    // La URL va escapada; se comprueba el valor decodificado.
+    let decoded = percent_decode_str(&out).decode_utf8_lossy().into_owned();
+    assert!(decoded.contains("state=estado-fijo"), "{decoded}");
+    assert!(
+        decoded.contains("redirect_uri=http://127.0.0.1:8765/callback"),
+        "{decoded}"
+    );
+
+    // Un state ajeno se rechaza.
+    let ajeno = run_cli_with_stdin(
+        mock.base(),
+        &config,
+        &args,
+        "http://127.0.0.1:8765/callback?state=otro&code=codigo\n",
+    );
+    assert!(!ajeno.status.success());
+    assert!(!config.exists());
+    assert!(
+        String::from_utf8_lossy(&ajeno.stderr).contains("state no coincide"),
+        "{}",
+        String::from_utf8_lossy(&ajeno.stderr)
+    );
+
+    // Con el state correcto se canjea el código y se guarda el refresh token.
+    let bueno = run_cli_with_stdin(
+        mock.base(),
+        &config,
+        &args,
+        "http://127.0.0.1:8765/callback?state=estado-fijo&code=codigo-de-prueba\n",
+    );
+    assert_ok(&bueno);
+
+    let saved: Value = serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+    assert_eq!(saved["access_token"], "token-renovado");
+    assert_eq!(saved["refresh_token"], "refresh-nuevo");
+    assert_eq!(saved["client_id"], "cid");
+}
+
+#[test]
+fn auth_manual_acepta_un_token_de_acceso_pegado() {
+    let mock = MockDrive::start();
+    let work = tempfile::tempdir().unwrap();
+    let config = config_path(work.path());
+
+    let output = run_cli_with_stdin(
+        mock.base(),
+        &config,
+        &[
+            "auth",
+            "--manual",
+            "--client-id",
+            "cid",
+            "--client-secret",
+            "sec",
+            "--quiet",
+        ],
+        "ya29.token-pegado-a-mano\n",
+    );
+    assert_ok(&output);
+
+    let saved: Value = serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+    assert_eq!(saved["access_token"], "ya29.token-pegado-a-mano");
+    assert!(saved.get("refresh_token").is_none());
+}
+
+#[test]
+fn auth_manual_falla_sin_entrada() {
+    let mock = MockDrive::start();
+    let work = tempfile::tempdir().unwrap();
+    let config = config_path(work.path());
+
+    let output = run_cli_with_stdin(
+        mock.base(),
+        &config,
+        &[
+            "auth",
+            "--manual",
+            "--client-id",
+            "cid",
+            "--client-secret",
+            "sec",
+            "--quiet",
+        ],
+        "",
+    );
+    assert!(!output.status.success());
+    assert!(!config.exists(), "no debe guardar nada si no hay entrada");
 }
 
 #[test]
