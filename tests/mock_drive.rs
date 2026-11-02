@@ -316,6 +316,21 @@ fn route(request: Request, base: &str, state: &Arc<Mutex<State>>) -> HttpRespons
 
 fn token_endpoint(request: &Request) -> HttpResponse {
     let params = parse_query(std::str::from_utf8(&request.body).unwrap_or(""));
+
+    // Simula la comprobación de --check-client.
+    if params.get("client_id").map(String::as_str) == Some("cliente-desconocido") {
+        return HttpResponse::json(
+            401,
+            &json!({"error": "invalid_client", "error_description": "The OAuth client was not found."}),
+        );
+    }
+    if params.get("code").map(String::as_str) == Some("codigo-de-prueba-drivesync") {
+        return HttpResponse::json(
+            400,
+            &json!({"error": "invalid_grant", "error_description": "Bad Request"}),
+        );
+    }
+
     match params.get("grant_type").map(String::as_str) {
         Some("refresh_token") | Some("authorization_code") => HttpResponse::json(
             200,
@@ -1196,6 +1211,59 @@ fn auth_manual_falla_sin_entrada() {
     );
     assert!(!output.status.success());
     assert!(!config.exists(), "no debe guardar nada si no hay entrada");
+}
+
+#[test]
+fn check_client_detecta_un_id_inexistente() {
+    let mock = MockDrive::start();
+    let work = tempfile::tempdir().unwrap();
+    let config = config_path(work.path());
+
+    let output = run_cli_without_token(
+        mock.base(),
+        &config,
+        &[
+            "auth",
+            "--check-client",
+            "--client-id",
+            "cliente-desconocido",
+            "--client-secret",
+            "x",
+        ],
+    );
+    assert!(!output.status.success());
+    let out = stdout(&output);
+    assert!(out.contains("NO encuentra"), "{out}");
+    assert!(out.contains("Aplicación de escritorio"), "{out}");
+    assert!(
+        !config.exists(),
+        "el diagnóstico no debe guardar configuración"
+    );
+}
+
+#[test]
+fn check_client_acepta_un_id_existente() {
+    let mock = MockDrive::start();
+    let work = tempfile::tempdir().unwrap();
+    let config = config_path(work.path());
+
+    let output = run_cli_without_token(
+        mock.base(),
+        &config,
+        &[
+            "auth",
+            "--check-client",
+            "--client-id",
+            "123456789012-abc.apps.googleusercontent.com",
+            "--client-secret",
+            "x",
+        ],
+    );
+    assert_ok(&output);
+    let out = stdout(&output);
+    assert!(out.contains("el cliente existe"), "{out}");
+    assert!(out.contains("invalid_grant"), "{out}");
+    assert!(!config.exists());
 }
 
 #[test]

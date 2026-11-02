@@ -98,6 +98,9 @@ struct AuthArgs {
     /// Valor de state a exigir en la respuesta (por defecto se genera uno)
     #[arg(long, value_name = "VALOR")]
     state: Option<String>,
+    /// Solo comprueba el client_id contra Google y sale (no guarda nada)
+    #[arg(long)]
+    check_client: bool,
 }
 
 #[derive(Subcommand)]
@@ -266,6 +269,7 @@ fn cmd_auth(global: &Global, args: AuthArgs) -> Result<()> {
         manual,
         redirect_uri,
         state,
+        check_client,
     } = args;
     let (mut config, path) = config::load_config(global.config.as_deref())?;
     config::apply_env(&mut config);
@@ -325,6 +329,13 @@ fn cmd_auth(global: &Global, args: AuthArgs) -> Result<()> {
         .or(config.client_secret.clone())
         .context(faltan_credenciales())?;
 
+    if check_client {
+        let redirect = redirect_uri
+            .clone()
+            .unwrap_or_else(|| format!("http://127.0.0.1:{port}/callback"));
+        return report_client_check(&client_id, &client_secret, &redirect);
+    }
+
     if !global.quiet && !client_id.ends_with(".apps.googleusercontent.com") {
         eprintln!(
             "[aviso] el client_id no termina en .apps.googleusercontent.com: los clientes \
@@ -366,6 +377,46 @@ fn cmd_auth(global: &Global, args: AuthArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn report_client_check(client_id: &str, client_secret: &str, redirect_uri: &str) -> Result<()> {
+    println!("client_id    : {client_id}");
+    println!("longitud     : {} caracteres", client_id.len());
+    println!("redirect_uri : {redirect_uri}");
+    println!("Comprobando contra Google...");
+
+    match auth::check_client(client_id, client_secret, redirect_uri)? {
+        auth::ClientCheck::Known { code } => {
+            println!("Resultado    : el cliente existe en Google (respuesta: {code})");
+            println!();
+            println!("El client_id es correcto. Si el navegador sigue diciendo");
+            println!("\"The OAuth client was not found\", revisa que la URL que abres sea la");
+            println!("que imprime este mismo comando, sin editar ni recortar.");
+            Ok(())
+        }
+        auth::ClientCheck::Unknown { detail } => {
+            println!("Resultado    : Google NO encuentra este cliente ({detail})");
+            println!();
+            println!("El client_id no existe. Causas habituales:");
+            println!(
+                "  - Copiaste el ID incompleto, o pegaste el del proyecto en vez del cliente."
+            );
+            println!("  - El cliente se borró o pertenece a otro proyecto de Google Cloud.");
+            println!("  - No es un client_id: los de cuenta de servicio son correos y los de");
+            println!("    API key son cadenas que empiezan por AIza.");
+            println!();
+            println!("Créalo en Google Cloud Console -> APIs y servicios -> Credenciales");
+            println!(
+                "-> Crear credenciales -> ID de cliente OAuth -> \"Aplicación de escritorio\"."
+            );
+            bail!("el client_id no existe en Google")
+        }
+        auth::ClientCheck::Other { detail } => {
+            println!("Resultado    : respuesta inesperada de Google");
+            println!("{detail}");
+            bail!("no se pudo determinar si el client_id es válido")
+        }
+    }
 }
 
 fn faltan_credenciales() -> String {

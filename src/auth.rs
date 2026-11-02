@@ -50,6 +50,57 @@ fn http_client() -> Result<Client> {
         .context("no se pudo crear el cliente HTTP")
 }
 
+/// Resultado de comprobar un par client_id / client_secret contra Google.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientCheck {
+    /// Google conoce el cliente y solo rechazó el código de prueba.
+    Known { code: String },
+    /// Google no encuentra el cliente (`invalid_client`).
+    Unknown { detail: String },
+    /// Respuesta que no es JSON de OAuth (proxy, HTML de error, etc.).
+    Other { detail: String },
+}
+
+/// Comprueba si un `client_id` existe en Google sin abrir el navegador.
+///
+/// Envía un código inválido al endpoint de tokens: si el cliente no existe la
+/// respuesta es `invalid_client`, y si existe se queja del código
+/// (`invalid_grant`). Así se distingue un ID mal copiado de un problema de
+/// redirección o de permisos.
+pub fn check_client(
+    client_id: &str,
+    client_secret: &str,
+    redirect_uri: &str,
+) -> Result<ClientCheck> {
+    let response = http_client()?
+        .post(token_endpoint())
+        .form(&[
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("code", "codigo-de-prueba-drivesync"),
+            ("grant_type", "authorization_code"),
+            ("redirect_uri", redirect_uri),
+        ])
+        .send()
+        .context("no se pudo contactar el endpoint de tokens de Google")?;
+
+    let body = response
+        .text()
+        .context("respuesta ilegible del endpoint de tokens")?;
+
+    let Ok(err) = serde_json::from_str::<OAuthErrorBody>(&body) else {
+        return Ok(ClientCheck::Other { detail: body });
+    };
+
+    let detail = err.error_description.unwrap_or_default();
+    Ok(match err.error.as_str() {
+        "invalid_client" => ClientCheck::Unknown { detail },
+        other => ClientCheck::Known {
+            code: other.to_string(),
+        },
+    })
+}
+
 fn post_token(params: &[(&str, String)]) -> Result<TokenResponse> {
     let response = http_client()?
         .post(token_endpoint())

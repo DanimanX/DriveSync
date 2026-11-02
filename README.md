@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/DanimanX/DriveSync/actions/workflows/ci.yml/badge.svg)](https://github.com/DanimanX/DriveSync/actions/workflows/ci.yml)
 
-Versión 0.1.1 · CLI en Rust para sincronizar archivos y carpetas con Google Drive usando un
+Versión 0.1.2 · CLI en Rust para sincronizar archivos y carpetas con Google Drive usando un
 token de Google. Sin SDKs pesados: habla directamente con la API v3 de Drive
 sobre HTTPS, guarda el estado de la sincronización y resuelve conflictos sin
 perder ninguna versión.
@@ -42,7 +42,7 @@ Cada tag publica una release con los binarios de `x86_64` y `aarch64` en
 <https://github.com/DanimanX/DriveSync/releases>.
 
 ```bash
-tag=v0.1.1
+tag=v0.1.2
 arch=x86_64-unknown-linux-gnu        # o aarch64-unknown-linux-gnu
 base="https://github.com/DanimanX/DriveSync/releases/download/$tag"
 
@@ -181,6 +181,15 @@ de estas:
 
 1. El `client_id` no está completo o tiene un espacio/retorno de carro al
    pegar. Debe terminar en `.apps.googleusercontent.com` y medir ~72 caracteres.
+   Compruébalo sin abrir el navegador:
+
+   ```bash
+   drivesync auth --check-client --client-id TU_ID --client-secret TU_SECRET
+   ```
+
+   Envía un código inválido al endpoint de tokens: si Google responde
+   `invalid_client` el cliente no existe; si responde `invalid_grant` el
+   `client_id` es correcto y el problema está en otra parte. No guarda nada.
 2. El cliente es de tipo **Android**, **iOS** o **cuenta de servicio**: solo los
    clientes de tipo **Aplicación de escritorio** o **Aplicación web** sirven
    para este flujo. Compruébalo en *Credenciales* del proyecto.
