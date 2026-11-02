@@ -8,7 +8,7 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use reqwest::blocking::{Client, RequestBuilder, Response};
+use reqwest::blocking::{Body, Client, RequestBuilder, Response};
 use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, LOCATION, RANGE};
 use reqwest::StatusCode;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -23,6 +23,10 @@ const FILE_FIELDS: &str =
 const CHUNK_SIZE: u64 = 8 * 1024 * 1024;
 const MULTIPART_LIMIT: u64 = 4 * 1024 * 1024;
 const MAX_ATTEMPTS: u32 = 5;
+/// Intentos por bloque de una carga reanudable (archivos grandes).
+const MAX_CHUNK_ATTEMPTS: u32 = 8;
+/// Cuántas veces se puede consultar el progreso de la sesión antes de rendirse.
+const MAX_RESUMES: u32 = 6;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RemoteFile {
@@ -92,6 +96,15 @@ pub struct DriveClient {
     verbose: bool,
 }
 
+/// Estado de una sesión de carga reanudable.
+#[derive(Debug)]
+enum SessionProgress {
+    /// Google ya recibió todo: trae el recurso final.
+    Complete(Value),
+    /// Bytes confirmados; hay que continuar desde ese desplazamiento.
+    ResumeAt(u64),
+}
+
 /// Totales de un subárbol remoto.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FolderSize {
@@ -155,7 +168,16 @@ impl DriveClient {
     }
 
     /// Ejecuta la petición con reintentos, refresco de token y backoff.
-    fn send<F>(&self, mut build: F) -> Result<Response>
+    fn send<F>(&self, build: F) -> Result<Response>
+    where
+        F: FnMut() -> Result<RequestBuilder>,
+    {
+        self.send_with_attempts(build, MAX_ATTEMPTS)
+    }
+
+    /// Igual que `send` pero con un número de intentos propio (bloques de
+    /// una carga reanudable, donde un fallo cuesta volver a empezar el bloque).
+    fn send_with_attempts<F>(&self, mut build: F, max_attempts: u32) -> Result<Response>
     where
         F: FnMut() -> Result<RequestBuilder>,
     {
@@ -179,14 +201,13 @@ impl DriveClient {
                         }
                     }
 
-                    if is_retryable(status) && attempt < MAX_ATTEMPTS {
+                    if is_retryable(status) && attempt < max_attempts {
                         let wait = retry_delay(&response, attempt);
                         drop(response);
                         if self.verbose {
                             eprintln!(
-                                "[reintento] HTTP {} (intento {}/{MAX_ATTEMPTS}), esperando {} s",
+                                "[reintento] HTTP {} (intento {attempt}/{max_attempts}), esperando {:.1} s",
                                 status.as_u16(),
-                                attempt,
                                 wait.as_secs_f32()
                             );
                         }
@@ -198,11 +219,11 @@ impl DriveClient {
                     return Ok(response);
                 }
                 Err(error) => {
-                    if attempt < MAX_ATTEMPTS && is_transient(&error) {
+                    if attempt < max_attempts && is_transient(&error) {
                         let wait = backoff(attempt);
                         if self.verbose {
                             eprintln!(
-                                "[reintento] error de red (intento {attempt}/{MAX_ATTEMPTS}): {error}"
+                                "[reintento] error de red (intento {attempt}/{max_attempts}): {error}"
                             );
                         }
                         sleep(wait);
@@ -484,52 +505,145 @@ impl DriveClient {
             .map(str::to_string)
             .context("Google no devolvió la URL de la sesión de carga")?;
 
-        let mut file =
-            File::open(path).with_context(|| format!("no se pudo abrir {}", path.display()))?;
         let mut offset = 0u64;
+        let mut resumes = 0u32;
+        let mut estancamientos = 0u32;
 
         while offset < size {
             let len = std::cmp::min(CHUNK_SIZE, size - offset);
-            let mut buffer = vec![0u8; len as usize];
-            file.seek(SeekFrom::Start(offset))?;
-            file.read_exact(&mut buffer)?;
-
             let start = offset;
             let end = offset + len - 1;
             let session = session_url.clone();
+            let file_path = path.to_path_buf();
 
-            let response = self.send(|| {
-                Ok(self
-                    .http
-                    .put(&session)
-                    .header(CONTENT_RANGE, format!("bytes {start}-{end}/{size}"))
-                    .header(CONTENT_LENGTH, len.to_string())
-                    .header(CONTENT_TYPE, mime)
-                    .body(buffer.clone()))
-            })?;
+            // El cuerpo se lee del disco en cada intento: nada de mantener el
+            // bloque en memoria ni de reenviar un buffer caducado.
+            let response = self.send_with_attempts(
+                move || {
+                    let mut file = File::open(&file_path)
+                        .with_context(|| format!("no se pudo abrir {}", file_path.display()))?;
+                    file.seek(SeekFrom::Start(start))?;
+                    Ok(self
+                        .http
+                        .put(&session)
+                        .header(CONTENT_RANGE, format!("bytes {start}-{end}/{size}"))
+                        .header(CONTENT_LENGTH, len.to_string())
+                        .header(CONTENT_TYPE, mime)
+                        .body(Body::sized(file.take(len), len)))
+                },
+                MAX_CHUNK_ATTEMPTS,
+            )?;
 
             let status = response.status();
             if status.as_u16() == 308 {
-                offset = end + 1;
-                if let Some(range) = response
+                let siguiente = response
                     .headers()
                     .get(RANGE)
                     .and_then(|value| value.to_str().ok())
-                {
-                    if let Some(next) = parse_range_end(range) {
-                        offset = next + 1;
-                    }
+                    .and_then(parse_range_end)
+                    .map(|last| last + 1)
+                    .unwrap_or(end + 1);
+                if self.verbose {
+                    eprintln!(
+                        "[carga] {}/{} ({:.0}%)",
+                        util::format_size(siguiente),
+                        util::format_size(size),
+                        (siguiente as f64 / size.max(1) as f64) * 100.0
+                    );
                 }
+                // Nunca se avanza "a la fuerza": si Google confirma menos de lo
+                // que ya se envió, hay que repetir desde ahí, no saltarse bytes.
+                if siguiente <= offset {
+                    estancamientos += 1;
+                    if estancamientos > 3 {
+                        bail!(
+                            "la carga no avanza: Google confirma {} de {} tras varios intentos",
+                            util::format_size(offset),
+                            util::format_size(size)
+                        );
+                    }
+                } else {
+                    estancamientos = 0;
+                }
+                offset = siguiente.min(size);
                 continue;
             }
 
-            let response = Self::ensure_ok(response)?;
-            return response
-                .json()
-                .context("respuesta inválida al completar la carga");
+            if status.is_success() {
+                return response
+                    .json()
+                    .context("respuesta inválida al completar la carga");
+            }
+
+            // Fallo persistente a mitad de la subida: se pregunta a Google
+            // cuánto tiene y se continúa desde ahí en vez de abortar el archivo.
+            if resumes >= MAX_RESUMES {
+                return Err(Self::ensure_ok(response).err().unwrap_or_else(|| {
+                    anyhow::anyhow!("la carga falló sin detalle del servidor")
+                }));
+            }
+            resumes += 1;
+
+            match self.session_progress(&session_url, size) {
+                Ok(SessionProgress::Complete(value)) => {
+                    return serde_json::from_value(value)
+                        .context("respuesta inválida de la sesión de carga");
+                }
+                Ok(SessionProgress::ResumeAt(next)) => {
+                    eprintln!(
+                        "[recuperado] la sesión conserva {}; se continúa desde ahí (intento {resumes}/{MAX_RESUMES})",
+                        util::format_size(next)
+                    );
+                    offset = next.min(size);
+                }
+                Err(error) => {
+                    let status = response.status();
+                    let detalle = response.text().unwrap_or_default();
+                    let mensaje = summarize_body(status.as_u16(), &detalle);
+                    return Err(anyhow::anyhow!(
+                        "{mensaje}; además no se pudo consultar el progreso de la sesión: {error:#}"
+                    ));
+                }
+            }
         }
 
         bail!("la sesión de carga terminó sin confirmación de Google")
+    }
+
+    /// Pregunta a Google cuántos bytes de la sesión ya recibió.
+    ///
+    /// `PUT` con `Content-Range: bytes */TOTAL` y cuerpo vacío: responde 308
+    /// con `Range` si falta contenido, o 200/201 con el archivo si ya terminó.
+    fn session_progress(&self, session_url: &str, size: u64) -> Result<SessionProgress> {
+        let token = self.tokens.borrow_mut().token()?;
+        let response = self
+            .http
+            .put(session_url)
+            .header(CONTENT_RANGE, format!("bytes */{size}"))
+            .header(CONTENT_LENGTH, "0")
+            .bearer_auth(token)
+            .send()
+            .context("no se pudo consultar el estado de la sesión de carga")?;
+
+        let status = response.status();
+        if status.as_u16() == 308 {
+            let next = response
+                .headers()
+                .get(RANGE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(parse_range_end)
+                .map(|last| last + 1)
+                .unwrap_or(0);
+            return Ok(SessionProgress::ResumeAt(next));
+        }
+        if status.is_success() {
+            let value = response.json().unwrap_or(Value::Null);
+            return Ok(SessionProgress::Complete(value));
+        }
+        bail!(
+            "Google respondió {} al consultar la sesión",
+            status.as_u16()
+        )
     }
 
     pub fn download_to(&self, file_id: &str, destination: &Path) -> Result<u64> {
@@ -698,7 +812,10 @@ impl DriveClient {
 }
 
 fn is_retryable(status: StatusCode) -> bool {
-    status == StatusCode::TOO_MANY_REQUESTS
+    // 408 lo emite el frontend de Google cuando el cliente tarda demasiado en
+    // enviar la petición: es transitorio y reintentar (o reanudar) funciona.
+    status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
         || status == StatusCode::INTERNAL_SERVER_ERROR
         || status == StatusCode::BAD_GATEWAY
         || status == StatusCode::SERVICE_UNAVAILABLE
@@ -724,6 +841,59 @@ fn retry_delay(response: &Response, attempt: u32) -> Duration {
 fn backoff(attempt: u32) -> Duration {
     let millis = 500u64.saturating_mul(1u64 << attempt.min(6));
     Duration::from_millis(millis.min(30_000))
+}
+
+/// Convierte un cuerpo de error en algo legible: los timeouts del frontend de
+/// Google llegan como una página HTML de cientos de líneas, que no aporta nada.
+fn summarize_body(status: u16, body: &str) -> String {
+    if let Some(message) = extract_error_message(body) {
+        return message;
+    }
+
+    let recortado = body.trim_start();
+    if recortado.starts_with("<!DOCTYPE")
+        || recortado.starts_with("<!doctype")
+        || recortado.starts_with("<html")
+    {
+        // Se intenta rescatar el <title>, que suele decir "Error 408 …".
+        let titulo = recortado
+            .find("<title>")
+            .and_then(|inicio| {
+                recortado[inicio + "<title>".len()..]
+                    .find("</title>")
+                    .map(|fin| {
+                        recortado[inicio + "<title>".len()..inicio + "<title>".len() + fin].trim()
+                    })
+            })
+            .filter(|titulo| !titulo.is_empty());
+
+        let base = match titulo {
+            Some(titulo) => format!("página de error HTML de Google ({titulo})"),
+            None => "página de error HTML de Google".to_string(),
+        };
+
+        return match status {
+            408 => format!(
+                "{base}: el servidor dejó de esperar la petición. Suele pasar con archivos grandes                  o conexiones lentas; se puede reintentar"
+            ),
+            502..=504 => format!("{base}: el servicio no está disponible en este momento"),
+            _ => base,
+        };
+    }
+
+    let linea: String = body
+        .lines()
+        .map(str::trim)
+        .find(|linea| !linea.is_empty())
+        .unwrap_or("")
+        .chars()
+        .take(200)
+        .collect();
+    if linea.is_empty() {
+        format!("sin cuerpo de respuesta (HTTP {status})")
+    } else {
+        linea
+    }
 }
 
 fn extract_error_message(body: &str) -> Option<String> {
@@ -797,6 +967,34 @@ mod tests {
         let json = r#"{"id":"1","name":"a","mimeType":"text/plain","size":"1234"}"#;
         let file: RemoteFile = serde_json::from_str(json).unwrap();
         assert_eq!(file.size, Some(1234));
+    }
+
+    #[test]
+    fn resume_un_error_html_de_timeout() {
+        let html = "<!DOCTYPE html>\n<html lang=en>\n<title>Error 408 (Request Timeout)!!1</title>\n                    <p><b>408.</b> <ins>That\u{2019}s an error.</ins>";
+        let texto = summarize_body(408, html);
+        assert!(texto.contains("Error 408"), "{texto}");
+        assert!(texto.contains("archivos grandes"), "{texto}");
+        assert!(!texto.contains("<html"), "no debe volcar el HTML: {texto}");
+        assert!(!texto.contains("DOCTYPE"), "{texto}");
+    }
+
+    #[test]
+    fn resume_error_json_y_texto_plano() {
+        let json =
+            r#"{"error":{"code":403,"message":"The user does not have sufficient permissions"}}"#;
+        assert_eq!(
+            summarize_body(403, json),
+            "The user does not have sufficient permissions"
+        );
+        assert_eq!(
+            summarize_body(500, "  algo se rompió  \n"),
+            "algo se rompió"
+        );
+        assert_eq!(
+            summarize_body(503, "   "),
+            "sin cuerpo de respuesta (HTTP 503)"
+        );
     }
 
     #[test]

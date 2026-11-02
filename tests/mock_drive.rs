@@ -55,6 +55,8 @@ struct State {
     sessions: HashMap<String, Session>,
     next_file: u64,
     next_session: u64,
+    /// Cuántos bloques de subida responderán 408 antes de aceptarse.
+    chunk_faults: usize,
 }
 
 impl State {
@@ -109,6 +111,12 @@ impl MockDrive {
     fn add_folder(&self, name: &str, parent: &str) -> String {
         let mut state = self.state.lock().unwrap();
         state.create(name, parent, FOLDER_MIME, Vec::new()).id
+    }
+
+    /// Hace que los próximos `n` bloques de subida fallen con 408 (timeout del
+    /// frontend, como en los archivos grandes reales).
+    fn fail_chunks(&self, n: usize) {
+        self.state.lock().unwrap().chunk_faults = n;
     }
 
     fn add_native(&self, name: &str, parent: &str) -> String {
@@ -522,10 +530,59 @@ fn start_session(
     }
 }
 
+/// Página HTML como la que devuelve el frontend de Google en un 408.
+fn timeout_page() -> HttpResponse {
+    HttpResponse {
+        status: 408,
+        headers: vec![
+            ("Content-Type".to_string(), "text/html; charset=utf-8".to_string()),
+            ("Retry-After".to_string(), "0".to_string()),
+        ],
+        body: b"<!DOCTYPE html><html lang=en><title>Error 408 (Request Timeout)!!1</title><p><b>408.</b> <ins>That\xe2\x80\x99s an error.</ins><p>Your client has taken too long to issue its request.</html>"
+            .to_vec(),
+    }
+}
+
 fn upload_chunk(id: &str, request: &Request, state: &Arc<Mutex<State>>) -> HttpResponse {
     let Some(range) = request.headers.get("content-range") else {
         return HttpResponse::error(400, "falta Content-Range");
     };
+
+    // Consulta de progreso: `Content-Range: bytes */TOTAL`, cuerpo vacío.
+    if let Some(total) = range.trim().strip_prefix("bytes */") {
+        let total: u64 = total.trim().parse().unwrap_or(0);
+        let state = state.lock().unwrap();
+        let Some(session) = state.sessions.get(id) else {
+            return HttpResponse::error(404, "sesión de carga desconocida");
+        };
+        let recibido = session.buffer.len() as u64;
+        if total > 0 && recibido >= total {
+            return HttpResponse::error(409, "la sesión ya se completó");
+        }
+        return if recibido == 0 {
+            HttpResponse {
+                status: 308,
+                headers: Vec::new(),
+                body: Vec::new(),
+            }
+        } else {
+            HttpResponse {
+                status: 308,
+                headers: vec![("Range".to_string(), format!("bytes=0-{}", recibido - 1))],
+                body: Vec::new(),
+            }
+        };
+    }
+
+    // Inyección de fallos: el bloque se rechaza sin tocar la sesión.
+    {
+        let mut guard = state.lock().unwrap();
+        if guard.chunk_faults > 0 {
+            guard.chunk_faults -= 1;
+            return timeout_page();
+        }
+    }
+
     let Some((start, end, total)) = parse_content_range(range) else {
         return HttpResponse::error(400, "Content-Range inválido");
     };
@@ -1018,6 +1075,66 @@ fn sube_archivos_grandes_con_carga_reanudable() {
     let remote = mock.content_by_name("big.bin").expect("archivo remoto");
     assert_eq!(remote.len(), data.len());
     assert_eq!(md5_hex(&remote), md5_hex(&data));
+}
+
+#[test]
+fn reintenta_timeouts_408_en_archivos_grandes() {
+    let mock = MockDrive::start();
+    let work = tempfile::tempdir().unwrap();
+    let config = config_path(work.path());
+    let local = work.path().join("grande");
+    fs::create_dir_all(&local).unwrap();
+
+    let data = vec![7u8; 9 * 1024 * 1024 + 55];
+    fs::write(local.join("big.bin"), &data).unwrap();
+    mock.add_folder("Tiempos", "root");
+
+    // Tres 408 seguidos: cabe dentro de los reintentos del bloque.
+    mock.fail_chunks(3);
+
+    let output = run_cli(
+        mock.base(),
+        &config,
+        &["upload", local.to_str().unwrap(), "--to", "Tiempos"],
+    );
+    assert_ok(&output);
+    assert!(stdout(&output).contains("1 subidos"), "{}", stdout(&output));
+
+    let remoto = mock.content_by_name("big.bin").expect("archivo remoto");
+    assert_eq!(md5_hex(&remoto), md5_hex(&data));
+}
+
+#[test]
+fn reanuda_la_carga_tras_timeouts_persistentes() {
+    let mock = MockDrive::start();
+    let work = tempfile::tempdir().unwrap();
+    let config = config_path(work.path());
+    let local = work.path().join("grande");
+    fs::create_dir_all(&local).unwrap();
+
+    let data = vec![9u8; 9 * 1024 * 1024 + 77];
+    fs::write(local.join("big.bin"), &data).unwrap();
+    mock.add_folder("Tiempos", "root");
+
+    // Más fallos que intentos por bloque: obliga a consultar el progreso de la
+    // sesión y continuar, que es lo que salva una subida de varios GB.
+    mock.fail_chunks(12);
+
+    let output = run_cli(
+        mock.base(),
+        &config,
+        &["upload", local.to_str().unwrap(), "--to", "Tiempos"],
+    );
+    assert_ok(&output);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("recuperado"),
+        "debe avisar de la reanudación: {err}"
+    );
+
+    let remoto = mock.content_by_name("big.bin").expect("archivo remoto");
+    assert_eq!(remoto.len(), data.len());
+    assert_eq!(md5_hex(&remoto), md5_hex(&data));
 }
 
 #[test]

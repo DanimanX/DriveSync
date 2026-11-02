@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/DanimanX/DriveSync/actions/workflows/ci.yml/badge.svg)](https://github.com/DanimanX/DriveSync/actions/workflows/ci.yml)
 
-Versión 0.3.1 · CLI en Rust para sincronizar archivos y carpetas con Google Drive usando un
+Versión 0.3.2 · CLI en Rust para sincronizar archivos y carpetas con Google Drive usando un
 token de Google. Sin SDKs pesados: habla directamente con la API v3 de Drive
 sobre HTTPS, guarda el estado de la sincronización y resuelve conflictos sin
 perder ninguna versión.
@@ -19,7 +19,9 @@ drivesync sync ./documentos --remote Backup/Documentos
   (`--manual`: imprime la URL y pide el código o el token a mano).
 - **Sincronización en tres vías** con un archivo de estado local: distingue
   "cambió en local", "cambió en remoto" y "borrado" en cada lado.
-- **Subidas reanudables por bloques** (8 MiB) para archivos grandes.
+- **Subidas reanudables por bloques** (8 MiB) para archivos grandes: si un
+  bloque falla, se reintenta y, si el fallo persiste, se pregunta a Google
+  cuánto lleva recibido y se continúa desde ahí.
 - **Descargas verificadas** con el MD5 que reporta Drive.
 - **Conflictos sin pérdida**: por defecto conserva la versión local y la remota
   (esta última como `archivo.conflicto-remoto-AAAAMMDD-HHMMSS.ext`).
@@ -44,7 +46,7 @@ Cada tag publica una release con los binarios de `x86_64` y `aarch64` en
 <https://github.com/DanimanX/DriveSync/releases>.
 
 ```bash
-tag=v0.3.1
+tag=v0.3.2
 arch=x86_64-unknown-linux-gnu        # o aarch64-unknown-linux-gnu
 base="https://github.com/DanimanX/DriveSync/releases/download/$tag"
 
@@ -244,6 +246,24 @@ Comprueba qué cuenta tienes configurada y con qué cliente:
 ```bash
 drivesync status
 ```
+
+**`408 Request Timeout` al subir un archivo grande**
+
+Google devuelve una página HTML "Your client has taken too long to issue its
+request". Es un timeout del frontend, transitorio, típico con archivos de varios
+GB o conexiones lentas. DriveSync lo reintenta y, si el bloque sigue fallando,
+consulta el progreso de la sesión de carga y continúa desde el último byte
+confirmado, sin volver a subir lo que ya está.
+
+Si aparece `[recuperado] la sesión conserva X`, es justo eso: la subida siguió
+adelante. Con `-v` se ve el avance bloque a bloque:
+
+```bash
+drivesync -v upload ./juego.nsp --to Backup
+```
+
+Si el error persiste tras varios intentos, el mensaje ya no vuelca el HTML:
+indica el código, la causa y que conviene reintentar.
 
 **`invalid_grant`**
 
