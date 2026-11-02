@@ -115,12 +115,26 @@ jobs:
         run: |
           set -euo pipefail
           ls -lh dist
+          host=$(uname -m)
+          echo "Arquitectura del runner: $host"
           for bin in dist/drivesync-*-*; do
             case "$bin" in
               *.tar.gz|*.txt) continue ;;
             esac
+            # upload-artifact no conserva el bit de ejecución.
+            chmod +x "$bin"
             file "$bin"
-            "$bin" --version
+            case "$(basename "$bin")" in
+              *x86_64*) want=x86_64 ;;
+              *aarch64*) want=aarch64 ;;
+              *) want="" ;;
+            esac
+            if [ "$want" = "$host" ]; then
+              echo "Ejecutando $(basename "$bin"):"
+              "$bin" --version
+            else
+              echo "Saltando ejecución: binario $want, runner $host"
+            fi
           done
 
       - name: Escribir notas de la release
