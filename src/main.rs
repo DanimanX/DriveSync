@@ -117,6 +117,9 @@ enum Command {
         /// Máximo de elementos a mostrar
         #[arg(long, default_value_t = 200)]
         max: usize,
+        /// No calcula el tamaño de las subcarpetas (evita recorrer todo el árbol)
+        #[arg(long)]
+        no_sizes: bool,
     },
     /// Sube archivos o carpetas, recursivamente en el caso de carpetas
     Upload {
@@ -231,7 +234,11 @@ fn run(global: &Global, command: Command) -> Result<()> {
             let client = build_client(global)?;
             match other {
                 Command::Status => cmd_status(global, &client),
-                Command::List { folder, max } => cmd_list(global, &client, folder, max),
+                Command::List {
+                    folder,
+                    max,
+                    no_sizes,
+                } => cmd_list(global, &client, folder, max, no_sizes),
                 Command::Upload {
                     paths,
                     remote,
@@ -506,6 +513,7 @@ fn cmd_list(
     client: &DriveClient,
     folder: Option<String>,
     max: usize,
+    no_sizes: bool,
 ) -> Result<()> {
     let folder = match folder {
         Some(reference) => client.resolve_ref(&reference)?,
@@ -530,10 +538,31 @@ fn cmd_list(
             folder.id
         );
     }
-    for child in children.iter().take(max) {
+
+    let visibles: Vec<&api::RemoteFile> = children.iter().take(max).collect();
+    for child in visibles {
         let modified = child.modified_time.as_deref().unwrap_or("-");
         if child.is_folder() {
-            println!("  [dir ] {}/  — {modified} — {}", child.name, child.id);
+            // El tamaño es recursivo: recorre el subárbol completo.
+            let (etiqueta, aviso) = if no_sizes {
+                (String::new(), None)
+            } else {
+                match client.folder_size(&child.id) {
+                    Ok(size) => (format!("[{}] ", size.human()), size.caveat()),
+                    Err(error) => (
+                        String::new(),
+                        Some(format!("no se pudo calcular el tamaño: {error:#}")),
+                    ),
+                }
+            };
+            // `[dir ] [3.0 GiB] Nombre/` sin dobles espacios cuando no hay tamaño.
+            println!(
+                "  [dir ] {etiqueta}{}/  — {modified} — {}",
+                child.name, child.id
+            );
+            if let Some(aviso) = aviso {
+                println!("         ({aviso}; el total no los incluye)");
+            }
         } else {
             let kind = if child.is_google_native() {
                 "google".to_string()

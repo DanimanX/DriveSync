@@ -92,6 +92,35 @@ pub struct DriveClient {
     verbose: bool,
 }
 
+/// Totales de un subárbol remoto.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FolderSize {
+    pub bytes: u64,
+    pub folders: usize,
+    pub files: usize,
+    /// Documentos nativos de Google (sin tamaño reportado).
+    pub native: usize,
+    /// Otros elementos sin `size` (accesos directos, etc.).
+    pub unknown: usize,
+}
+
+impl FolderSize {
+    pub fn human(&self) -> String {
+        util::format_size(self.bytes)
+    }
+
+    /// Aviso cuando el total no cubre todo el contenido.
+    pub fn caveat(&self) -> Option<String> {
+        if self.native > 0 {
+            Some(format!("{} documento(s) de Google sin tamaño", self.native))
+        } else if self.unknown > 0 {
+            Some(format!("{} elemento(s) sin tamaño reportado", self.unknown))
+        } else {
+            None
+        }
+    }
+}
+
 impl DriveClient {
     pub fn new(tokens: TokenProvider, api_base: Option<String>, verbose: bool) -> Result<Self> {
         let base = api_base
@@ -558,6 +587,33 @@ impl DriveClient {
         })?;
         Self::ensure_ok(response)?;
         Ok(())
+    }
+
+    /// Suma recursivamente el tamaño de una carpeta.
+    ///
+    /// Los documentos nativos de Google no reportan tamaño (no tienen
+    /// contenido binario descargable), así que se cuentan aparte para poder
+    /// avisar de que el total no los incluye.
+    pub fn folder_size(&self, folder_id: &str) -> Result<FolderSize> {
+        let mut size = FolderSize::default();
+        let mut stack = vec![folder_id.to_string()];
+
+        while let Some(current) = stack.pop() {
+            for child in self.list_children(&current)? {
+                if child.is_folder() {
+                    size.folders += 1;
+                    stack.push(child.id);
+                } else if child.is_google_native() {
+                    size.native += 1;
+                } else if let Some(bytes) = child.size {
+                    size.bytes = size.bytes.saturating_add(bytes);
+                    size.files += 1;
+                } else {
+                    size.unknown += 1;
+                }
+            }
+        }
+        Ok(size)
     }
 
     pub fn about(&self) -> Result<Value> {

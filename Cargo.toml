@@ -1,6 +1,6 @@
 [package]
 name = "drivesync"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 rust-version = "1.74"
 description = "CLI para sincronizar archivos y carpetas con Google Drive usando un token de Google"

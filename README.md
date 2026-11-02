@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/DanimanX/DriveSync/actions/workflows/ci.yml/badge.svg)](https://github.com/DanimanX/DriveSync/actions/workflows/ci.yml)
 
-Versión 0.3.0 · CLI en Rust para sincronizar archivos y carpetas con Google Drive usando un
+Versión 0.3.1 · CLI en Rust para sincronizar archivos y carpetas con Google Drive usando un
 token de Google. Sin SDKs pesados: habla directamente con la API v3 de Drive
 sobre HTTPS, guarda el estado de la sincronización y resuelve conflictos sin
 perder ninguna versión.
@@ -24,6 +24,8 @@ drivesync sync ./documentos --remote Backup/Documentos
 - **Conflictos sin pérdida**: por defecto conserva la versión local y la remota
   (esta última como `archivo.conflicto-remoto-AAAAMMDD-HHMMSS.ext`).
 - **Comandos sueltos**: `list`, `upload`, `download`, `mkdir`, `status`.
+- **Tamaño de carpetas** en `list`: suma el subárbol completo
+  (`[dir ] [3.0 GiB] Backup/`), con `--no-sizes` para evitarlo.
 - **Simulación** con `--dry-run`, exclusiones con `--exclude` y direcciones
   `push`/`pull`/`both`.
 - **Reintentos** con backoff para 429/5xx y renovación automática del token.
@@ -42,7 +44,7 @@ Cada tag publica una release con los binarios de `x86_64` y `aarch64` en
 <https://github.com/DanimanX/DriveSync/releases>.
 
 ```bash
-tag=v0.3.0
+tag=v0.3.1
 arch=x86_64-unknown-linux-gnu        # o aarch64-unknown-linux-gnu
 base="https://github.com/DanimanX/DriveSync/releases/download/$tag"
 
@@ -251,7 +253,7 @@ Vuelve a ejecutar `drivesync auth`.
 ## Comandos
 
 ```
-drivesync list   [--folder CARPETA] [--max N]
+drivesync list   [--folder CARPETA] [--max N] [--no-sizes]
 drivesync upload RUTA... [--to CARPETA] [--name NOMBRE] [--contents] [--exclude PATRÓN]
 drivesync download REMOTO [--to RUTA] [--overwrite]
 drivesync mkdir  NOMBRE [--folder CARPETA] [--literal]
@@ -281,8 +283,11 @@ referenciarse por su ID.
 ### Ejemplos
 
 ```bash
-# Listar una carpeta por ruta
+# Listar una carpeta por ruta (las carpetas muestran su tamaño recursivo)
 drivesync list --folder Backup/2026
+
+# Igual pero sin calcular tamaños (más rápido en árboles enormes)
+drivesync list --folder Backup --no-sizes
 
 # Subir un archivo (si ya existe, se actualiza)
 drivesync upload ./informe.pdf --to Backup

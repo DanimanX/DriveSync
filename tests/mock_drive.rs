@@ -111,6 +111,18 @@ impl MockDrive {
         state.create(name, parent, FOLDER_MIME, Vec::new()).id
     }
 
+    fn add_native(&self, name: &str, parent: &str) -> String {
+        let mut state = self.state.lock().unwrap();
+        state
+            .create(
+                name,
+                parent,
+                "application/vnd.google-apps.document",
+                Vec::new(),
+            )
+            .id
+    }
+
     fn add_file(&self, name: &str, parent: &str, content: &[u8]) -> String {
         let mut state = self.state.lock().unwrap();
         state
@@ -1785,6 +1797,73 @@ fn upload_sigue_tras_un_error_y_termina_con_fallo() {
     assert_eq!(mock.content_by_name("zzz.txt").as_deref(), Some(&b"z"[..]));
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(err.contains("sub"), "{err}");
+}
+
+#[test]
+fn list_muestra_el_tamano_recursivo_de_las_carpetas() {
+    let mock = MockDrive::start();
+    let work = tempfile::tempdir().unwrap();
+    let config = config_path(work.path());
+
+    let backup = mock.add_folder("Backup", "root");
+    let sub = mock.add_folder("Sub", &backup);
+    mock.add_file("a.bin", &backup, &vec![0u8; 1024]);
+    mock.add_file("b.bin", &sub, &vec![0u8; 512]);
+    mock.add_folder("Vacia", &backup);
+
+    // En la raíz, Backup debe sumar su subárbol completo: 1024 + 512 = 1.5 KiB.
+    let output = run_cli(mock.base(), &config, &["list"]);
+    assert_ok(&output);
+    let out = stdout(&output);
+    assert!(out.contains("[1.5 KiB] Backup/"), "{out}");
+
+    // Dentro de Backup: Sub suma 512 B, Vacia 0 B y los archivos sueltos 1.0 KiB.
+    let output = run_cli(mock.base(), &config, &["list", "--folder", "Backup"]);
+    assert_ok(&output);
+    let out = stdout(&output);
+    assert!(out.contains("[512 B] Sub/"), "{out}");
+    assert!(
+        out.contains("[0 B] Vacia/"),
+        "una carpeta vacía no se omite: {out}"
+    );
+    assert!(out.contains("(1.0 KiB)"), "{out}");
+}
+
+#[test]
+fn list_puede_omitir_los_tamanos() {
+    let mock = MockDrive::start();
+    let work = tempfile::tempdir().unwrap();
+    let config = config_path(work.path());
+    let backup = mock.add_folder("Backup", "root");
+    mock.add_file("a.bin", &backup, &vec![0u8; 2048]);
+
+    let output = run_cli(mock.base(), &config, &["list", "--no-sizes"]);
+    assert_ok(&output);
+    let out = stdout(&output);
+    assert!(out.contains("[dir ] Backup/"), "{out}");
+    assert!(
+        !out.contains("KiB]"),
+        "no debe mostrar tamaño de carpeta: {out}"
+    );
+}
+
+#[test]
+fn list_avisa_de_documentos_de_google_sin_tamano() {
+    let mock = MockDrive::start();
+    let work = tempfile::tempdir().unwrap();
+    let config = config_path(work.path());
+    let backup = mock.add_folder("Backup", "root");
+    mock.add_file("a.bin", &backup, &vec![0u8; 1024]);
+    mock.add_native("notas", &backup);
+
+    let output = run_cli(mock.base(), &config, &["list"]);
+    assert_ok(&output);
+    let out = stdout(&output);
+    assert!(out.contains("[1.0 KiB] Backup/"), "{out}");
+    assert!(
+        out.contains("documento(s) de Google sin tamaño"),
+        "debe avisar de que el total no los incluye: {out}"
+    );
 }
 
 #[test]
