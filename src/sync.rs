@@ -36,10 +36,35 @@ pub enum ConflictPolicy {
     KeepRemote,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum DeleteMode {
+    /// No propaga borrados: solo avisa de lo que falta en cada lado
+    Never,
+    /// Borra en Drive lo que ya no existe en local (por defecto)
+    #[default]
+    Remote,
+    /// Borra en local lo que ya no existe en Drive
+    Local,
+    /// Propaga borrados en ambos sentidos
+    Both,
+}
+
+impl DeleteMode {
+    /// ¿Se mueve a la papelera de Drive lo que falta en local?
+    pub fn trashes_remote(self) -> bool {
+        matches!(self, Self::Remote | Self::Both)
+    }
+
+    /// ¿Se borra en local lo que falta en Drive?
+    pub fn deletes_local(self) -> bool {
+        matches!(self, Self::Local | Self::Both)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SyncOptions {
     pub direction: Direction,
-    pub delete: bool,
+    pub delete: DeleteMode,
     pub conflict: ConflictPolicy,
     pub dry_run: bool,
     pub verbose: bool,
@@ -329,15 +354,24 @@ pub fn build_plan(
                 }
                 (Some(_), None) => Some(Action::UploadNew { rel: rel.clone() }),
                 (None, Some(remote_file)) => {
-                    if options.delete {
+                    // Solo se borra en Drive lo que el estado registra como
+                    // sincronizado y sigue intacto: nunca contenido ajeno.
+                    let synced = base
+                        .map(|entry| entry.remote_md5.as_deref() == Some(remote_md5))
+                        .unwrap_or(false);
+                    if synced && options.delete.trashes_remote() {
                         Some(Action::TrashRemote {
                             rel: rel.clone(),
                             remote_id: remote_file.id.clone(),
                         })
                     } else {
-                        plan.notes.push(format!(
-                            "solo en remoto: {rel} (usa --delete para eliminarlo)"
-                        ));
+                        plan.notes.push(if synced {
+                            format!("solo en remoto: {rel} (usa --delete para eliminarlo de Drive)")
+                        } else {
+                            format!(
+                                "solo en remoto: {rel} (no está en el estado; no se borra de Drive)"
+                            )
+                        });
                         None
                     }
                 }
@@ -359,7 +393,7 @@ pub fn build_plan(
                     remote_id: remote_file.id.clone(),
                 }),
                 (Some(_), None) => {
-                    if options.delete {
+                    if options.delete.deletes_local() {
                         Some(Action::DeleteLocal { rel: rel.clone() })
                     } else {
                         plan.notes.push(format!(
@@ -411,7 +445,7 @@ pub fn build_plan(
                         if !entry.remote_id.is_empty()
                             && entry.local_md5.as_deref() == Some(local_file.md5.as_str()) =>
                     {
-                        if options.delete {
+                        if options.delete.deletes_local() {
                             Some(Action::DeleteLocal { rel: rel.clone() })
                         } else {
                             plan.notes.push(format!(
@@ -424,7 +458,7 @@ pub fn build_plan(
                 },
                 (None, Some(remote_file)) => match base {
                     Some(entry) if entry.remote_md5.as_deref() == Some(remote_md5) => {
-                        if options.delete {
+                        if options.delete.trashes_remote() {
                             Some(Action::TrashRemote {
                                 rel: rel.clone(),
                                 remote_id: remote_file.id.clone(),
@@ -904,7 +938,7 @@ mod tests {
         (local_tree, remote_tree)
     }
 
-    fn options(direction: Direction, delete: bool) -> SyncOptions {
+    fn options(direction: Direction, delete: DeleteMode) -> SyncOptions {
         SyncOptions {
             direction,
             delete,
@@ -937,7 +971,7 @@ mod tests {
             &local,
             &remote,
             &State::default(),
-            &options(Direction::Both, false),
+            &options(Direction::Both, DeleteMode::Never),
         );
         assert!(matches!(
             plan.actions.as_slice(),
@@ -955,7 +989,7 @@ mod tests {
             &local,
             &remote,
             &State::default(),
-            &options(Direction::Both, false),
+            &options(Direction::Both, DeleteMode::Never),
         );
         assert!(matches!(
             plan.actions.as_slice(),
@@ -970,7 +1004,12 @@ mod tests {
             vec![("a.txt", remote("id", "bbb"))],
         );
         let state = state_with("a.txt", "aaa", "aaa");
-        let plan = build_plan(&local, &remote, &state, &options(Direction::Both, false));
+        let plan = build_plan(
+            &local,
+            &remote,
+            &state,
+            &options(Direction::Both, DeleteMode::Never),
+        );
         assert!(matches!(
             plan.actions.as_slice(),
             [Action::DownloadUpdate { .. }]
@@ -984,7 +1023,12 @@ mod tests {
             vec![("a.txt", remote("id", "aaa"))],
         );
         let state = state_with("a.txt", "aaa", "aaa");
-        let plan = build_plan(&local, &remote, &state, &options(Direction::Both, false));
+        let plan = build_plan(
+            &local,
+            &remote,
+            &state,
+            &options(Direction::Both, DeleteMode::Never),
+        );
         assert!(matches!(
             plan.actions.as_slice(),
             [Action::UploadUpdate { .. }]
@@ -998,7 +1042,12 @@ mod tests {
             vec![("a.txt", remote("id", "ccc"))],
         );
         let state = state_with("a.txt", "aaa", "aaa");
-        let plan = build_plan(&local, &remote, &state, &options(Direction::Both, false));
+        let plan = build_plan(
+            &local,
+            &remote,
+            &state,
+            &options(Direction::Both, DeleteMode::Never),
+        );
         assert!(matches!(plan.actions.as_slice(), [Action::Conflict { .. }]));
     }
 
@@ -1006,7 +1055,12 @@ mod tests {
     fn borrado_remoto_con_delete() {
         let (local, remote) = tree(vec![("a.txt", local("aaa"))], vec![]);
         let state = state_with("a.txt", "aaa", "aaa");
-        let plan = build_plan(&local, &remote, &state, &options(Direction::Both, true));
+        let plan = build_plan(
+            &local,
+            &remote,
+            &state,
+            &options(Direction::Both, DeleteMode::Both),
+        );
         assert!(matches!(
             plan.actions.as_slice(),
             [Action::DeleteLocal { .. }]
@@ -1017,7 +1071,12 @@ mod tests {
     fn borrado_remoto_sin_delete_avisa() {
         let (local, remote) = tree(vec![("a.txt", local("aaa"))], vec![]);
         let state = state_with("a.txt", "aaa", "aaa");
-        let plan = build_plan(&local, &remote, &state, &options(Direction::Both, false));
+        let plan = build_plan(
+            &local,
+            &remote,
+            &state,
+            &options(Direction::Both, DeleteMode::Never),
+        );
         assert!(plan.actions.is_empty());
         assert_eq!(plan.notes.len(), 1);
     }
@@ -1026,7 +1085,88 @@ mod tests {
     fn borrado_local_con_delete() {
         let (local, remote) = tree(vec![], vec![("a.txt", remote("id", "aaa"))]);
         let state = state_with("a.txt", "aaa", "aaa");
-        let plan = build_plan(&local, &remote, &state, &options(Direction::Both, true));
+        let plan = build_plan(
+            &local,
+            &remote,
+            &state,
+            &options(Direction::Both, DeleteMode::Both),
+        );
+        assert!(matches!(
+            plan.actions.as_slice(),
+            [Action::TrashRemote { .. }]
+        ));
+    }
+
+    #[test]
+    fn borrado_local_se_propaga_a_drive_por_defecto() {
+        let (local, remote) = tree(vec![], vec![("a.txt", remote("id", "aaa"))]);
+        let state = state_with("a.txt", "aaa", "aaa");
+        let plan = build_plan(
+            &local,
+            &remote,
+            &state,
+            &options(Direction::Both, DeleteMode::default()),
+        );
+        assert!(matches!(
+            plan.actions.as_slice(),
+            [Action::TrashRemote { .. }]
+        ));
+        assert!(plan.notes.is_empty());
+    }
+
+    #[test]
+    fn borrado_remoto_no_toca_local_por_defecto() {
+        let (local, remote) = tree(vec![("a.txt", local("aaa"))], vec![]);
+        let state = state_with("a.txt", "aaa", "aaa");
+        let plan = build_plan(
+            &local,
+            &remote,
+            &state,
+            &options(Direction::Both, DeleteMode::default()),
+        );
+        assert!(plan.actions.is_empty());
+        assert_eq!(plan.notes.len(), 1);
+        assert!(plan.notes[0].contains("eliminado en remoto"));
+    }
+
+    #[test]
+    fn delete_local_solo_ignora_lo_que_falta_en_local() {
+        let (local, remote) = tree(vec![], vec![("a.txt", remote("id", "aaa"))]);
+        let state = state_with("a.txt", "aaa", "aaa");
+        let plan = build_plan(
+            &local,
+            &remote,
+            &state,
+            &options(Direction::Both, DeleteMode::Local),
+        );
+        assert!(plan.actions.is_empty());
+        assert_eq!(plan.notes.len(), 1);
+    }
+
+    #[test]
+    fn solo_remoto_por_defecto_no_se_borra_sin_estado_previo() {
+        let (local, remote) = tree(vec![], vec![("a.txt", remote("id", "aaa"))]);
+        let plan = build_plan(
+            &local,
+            &remote,
+            &State::default(),
+            &options(Direction::Push, DeleteMode::default()),
+        );
+        assert!(plan.actions.is_empty());
+        assert_eq!(plan.notes.len(), 1);
+        assert!(plan.notes[0].contains("no está en el estado"));
+    }
+
+    #[test]
+    fn push_borra_en_drive_lo_que_estaba_sincronizado() {
+        let (local, remote) = tree(vec![], vec![("a.txt", remote("id", "aaa"))]);
+        let state = state_with("a.txt", "aaa", "aaa");
+        let plan = build_plan(
+            &local,
+            &remote,
+            &state,
+            &options(Direction::Push, DeleteMode::default()),
+        );
         assert!(matches!(
             plan.actions.as_slice(),
             [Action::TrashRemote { .. }]
@@ -1037,7 +1177,12 @@ mod tests {
     fn recrea_local_borrado_pero_modificado_en_remoto() {
         let (local, remote) = tree(vec![], vec![("a.txt", remote("id", "bbb"))]);
         let state = state_with("a.txt", "aaa", "aaa");
-        let plan = build_plan(&local, &remote, &state, &options(Direction::Both, false));
+        let plan = build_plan(
+            &local,
+            &remote,
+            &state,
+            &options(Direction::Both, DeleteMode::Never),
+        );
         assert!(matches!(
             plan.actions.as_slice(),
             [Action::DownloadNew { .. }]
@@ -1051,7 +1196,12 @@ mod tests {
             vec![("a.txt", remote("id", "ccc"))],
         );
         let state = state_with("a.txt", "aaa", "ccc");
-        let plan = build_plan(&local, &remote, &state, &options(Direction::Push, false));
+        let plan = build_plan(
+            &local,
+            &remote,
+            &state,
+            &options(Direction::Push, DeleteMode::Never),
+        );
         assert!(matches!(
             plan.actions.as_slice(),
             [Action::UploadUpdate { .. }]
@@ -1068,7 +1218,7 @@ mod tests {
             &local,
             &remote,
             &State::default(),
-            &options(Direction::Pull, false),
+            &options(Direction::Pull, DeleteMode::Never),
         );
         assert!(matches!(
             plan.actions.as_slice(),
@@ -1080,7 +1230,12 @@ mod tests {
     fn purga_entradas_huerfanas() {
         let (local, remote) = tree(vec![], vec![]);
         let state = state_with("viejo.txt", "aaa", "aaa");
-        let plan = build_plan(&local, &remote, &state, &options(Direction::Both, false));
+        let plan = build_plan(
+            &local,
+            &remote,
+            &state,
+            &options(Direction::Both, DeleteMode::Never),
+        );
         assert_eq!(plan.prune, vec!["viejo.txt".to_string()]);
     }
 
@@ -1100,7 +1255,12 @@ mod tests {
                 ..Default::default()
             },
         );
-        let plan = build_plan(&local, &remote, &state, &options(Direction::Both, true));
+        let plan = build_plan(
+            &local,
+            &remote,
+            &state,
+            &options(Direction::Both, DeleteMode::Both),
+        );
         assert!(matches!(plan.actions[0], Action::UploadNew { .. }));
         assert!(matches!(plan.actions[1], Action::TrashRemote { .. }));
     }

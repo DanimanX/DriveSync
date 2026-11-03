@@ -19,6 +19,9 @@ drivesync sync ./documentos --remote Backup/Documentos
   (`--manual`: imprime la URL y pide el código o el token a mano).
 - **Sincronización en tres vías** con un archivo de estado local: distingue
   "cambió en local", "cambió en remoto" y "borrado" en cada lado.
+- **Borrados propagados**: lo que desaparece del directorio de origen se mueve
+  a la papelera de Drive (`--delete` extiende los borrados al lado local y
+  `--no-delete` solo avisa).
 - **Subidas reanudables por bloques** (8 MiB) para archivos grandes: si un
   bloque falla, se reintenta y, si el fallo persiste, se pregunta a Google
   cuánto lleva recibido y se continúa desde ahí.
@@ -332,8 +335,11 @@ drivesync sync ./documentos --remote Backup/Documentos --dry-run
 drivesync sync ./documentos --remote Backup/Documentos \
   --exclude '*.tmp' --exclude 'cache/**'
 
-# Solo subir cambios y propagar borrados
-drivesync sync ./documentos --remote Backup/Documentos --direction push --delete
+# Propagar los borrados también de Drive a local (por defecto solo va a Drive)
+drivesync sync ./documentos --remote Backup/Documentos --delete
+
+# No borrar nada: solo avisar de lo que falta en cada lado
+drivesync sync ./documentos --remote Backup/Documentos --no-delete
 
 # Solo bajar cambios (el remoto manda)
 drivesync sync ./documentos --remote Backup/Documentos --direction pull
@@ -381,14 +387,24 @@ Con `--direction both` (por defecto):
 - Cambió el local → **actualizar remoto**.
 - Cambió el remoto → **actualizar local**.
 - Ambos cambiaron → **conflicto**.
-- Local borrado (y remoto intacto) → con `--delete`, mover el remoto a la
-  papelera; sin `--delete`, solo avisar.
-- Remoto borrado (y local intacto) → con `--delete`, borrar el local; sin
-  `--delete`, solo avisar.
+- Local borrado (y remoto intacto) → mover el remoto a la papelera de Drive.
+- Remoto borrado (y local intacto) → con `--delete`, borrar el local; sin él,
+  solo avisar.
 - Lado borrado pero el otro modificado → se restaura la versión modificada.
 
-Los borrados **nunca** se propagan sin `--delete`. Los archivos remotos se
-mueven a la papelera de Drive (recuperables).
+Por defecto los borrados van **solo del directorio local a Drive**: si un
+archivo ya no existe en el directorio de origen, la siguiente pasada lo manda a
+la papelera. `--delete` acepta el lado a propagar:
+
+- `--delete` (o `--delete=both`): ambos sentidos, también Drive → local.
+- `--delete=remote`: solo local → Drive, el comportamiento por defecto.
+- `--delete=local`: solo Drive → local.
+- `--delete=never` (o `--no-delete`): nada, solo avisos.
+
+Nunca se borra en Drive algo que el estado no registre como sincronizado, ni un
+archivo remoto que haya cambiado desde la última pasada: en esos casos se
+avisa o se restaura la versión remota. Los archivos remotos se mueven a la
+papelera de Drive (recuperables).
 
 ### Conflictos
 
@@ -433,6 +449,10 @@ escritura del estado, así que dos procesos nunca se pisan entre medias.
   habría que exportarlos a un formato concreto.
 - Los **accesos directos** de Drive y los tipos no binarios se omiten.
 - No se borran carpetas vacías: se propagan archivos, no la estructura vacía.
+- Si el directorio de origen no está montado (o se vacía por error), la pasada
+  siguiente lo interpreta como "todo borrado" y manda a la papelera lo que
+  estaba sincronizado. En orígenes que puedan faltar, revisa el plan con
+  `--dry-run` o usa `--no-delete`.
 - Se calcula el MD5 de todos los archivos locales en cada pasada (correcto,
   pero más lento en árboles muy grandes).
 - La sincronización es secuencial (una operación a la vez) y no reanuda una

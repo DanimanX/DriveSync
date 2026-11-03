@@ -17,7 +17,7 @@ use serde_json::Value;
 use crate::api::DriveClient;
 use crate::auth::{AuthOptions, TokenProvider};
 use crate::config::{Config, DEFAULT_SCOPE};
-use crate::sync::{ConflictPolicy, Direction, SyncOptions};
+use crate::sync::{ConflictPolicy, DeleteMode, Direction, SyncOptions};
 
 const EJEMPLOS: &str = "\
 Ejemplos:
@@ -27,6 +27,7 @@ Ejemplos:
   drivesync list --folder Backup
   drivesync sync ./documentos --remote Backup/Documentos
   drivesync sync ./fotos --remote 1AbCdEf... --delete --dry-run
+  drivesync sync ./fotos --remote 1AbCdEf... --no-delete --dry-run
   drivesync upload ./informe.pdf --to Backup
   drivesync download Backup/informe.pdf --to ./descargas
 
@@ -175,9 +176,19 @@ enum Command {
         /// Dirección de la sincronización
         #[arg(long, value_enum, default_value = "both")]
         direction: Direction,
-        /// Propaga borrados (con cuidado)
-        #[arg(long)]
-        delete: bool,
+        /// Borrados: qué lados se propagan (por defecto solo hacia Drive)
+        #[arg(
+            long,
+            value_enum,
+            value_name = "LADO",
+            num_args = 0..=1,
+            default_value_t = DeleteMode::Remote,
+            default_missing_value = "both",
+        )]
+        delete: DeleteMode,
+        /// No borra nada: solo avisa de lo que falta en cada lado
+        #[arg(long = "no-delete", conflicts_with = "delete")]
+        no_delete: bool,
         /// Qué hacer cuando ambos lados cambiaron
         #[arg(long, value_enum, default_value = "keep-both")]
         conflict: ConflictPolicy,
@@ -265,11 +276,20 @@ fn run(global: &Global, command: Command) -> Result<()> {
                     remote,
                     direction,
                     delete,
+                    no_delete,
                     conflict,
                     exclude,
                     no_state,
                 } => cmd_sync(
-                    global, &client, path, remote, direction, delete, conflict, exclude, no_state,
+                    global,
+                    &client,
+                    path,
+                    remote,
+                    direction,
+                    if no_delete { DeleteMode::Never } else { delete },
+                    conflict,
+                    exclude,
+                    no_state,
                 ),
                 Command::Auth(_) | Command::Logout => unreachable!(),
             }
@@ -1193,7 +1213,7 @@ fn cmd_sync(
     root: PathBuf,
     remote: Option<String>,
     direction: Direction,
-    delete: bool,
+    delete: DeleteMode,
     conflict: ConflictPolicy,
     exclude: Vec<String>,
     no_state: bool,

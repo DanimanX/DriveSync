@@ -1011,6 +1011,111 @@ fn sincroniza_subidas_bajadas_conflictos_y_borrados() {
 }
 
 #[test]
+fn propaga_borrados_locales_a_drive_sin_pedir_delete() {
+    let mock = MockDrive::start();
+    let work = tempfile::tempdir().unwrap();
+    let config = config_path(work.path());
+    let local = work.path().join("local");
+    fs::create_dir_all(&local).unwrap();
+    fs::write(local.join("se-va.txt"), b"adios").unwrap();
+    fs::write(local.join("se-queda.txt"), b"hola").unwrap();
+    mock.add_folder("Purga", "root");
+    let local_str = local.to_str().unwrap();
+
+    let output = run_cli(
+        mock.base(),
+        &config,
+        &["sync", local_str, "--remote", "Purga"],
+    );
+    assert_ok(&output);
+    assert!(stdout(&output).contains("2 subidos"), "{}", stdout(&output));
+
+    // El archivo desaparece del directorio de origen: sin ninguna bandera debe
+    // quedar fuera de Drive.
+    fs::remove_file(local.join("se-va.txt")).unwrap();
+    let output = run_cli(
+        mock.base(),
+        &config,
+        &["sync", local_str, "--remote", "Purga"],
+    );
+    assert_ok(&output);
+    let out = stdout(&output);
+    assert!(out.contains("1 eliminados"), "{out}");
+    assert!(out.contains("[borrar-remoto] se-va.txt"), "{out}");
+    assert!(mock.is_trashed("se-va.txt"));
+    assert_eq!(
+        mock.content_by_name("se-queda.txt").as_deref(),
+        Some(&b"hola"[..])
+    );
+}
+
+#[test]
+fn no_delete_solo_avisa_del_borrado_local() {
+    let mock = MockDrive::start();
+    let work = tempfile::tempdir().unwrap();
+    let config = config_path(work.path());
+    let local = work.path().join("local");
+    fs::create_dir_all(&local).unwrap();
+    fs::write(local.join("se-va.txt"), b"adios").unwrap();
+    mock.add_folder("Conserva", "root");
+    let local_str = local.to_str().unwrap();
+
+    let output = run_cli(
+        mock.base(),
+        &config,
+        &["sync", local_str, "--remote", "Conserva"],
+    );
+    assert_ok(&output);
+
+    fs::remove_file(local.join("se-va.txt")).unwrap();
+    let output = run_cli(
+        mock.base(),
+        &config,
+        &["sync", local_str, "--remote", "Conserva", "--no-delete"],
+    );
+    assert_ok(&output);
+    let out = stdout(&output);
+    assert!(out.contains("0 eliminados"), "{out}");
+    assert!(out.contains("eliminado en local"), "{out}");
+    assert!(!mock.is_trashed("se-va.txt"));
+    assert_eq!(
+        mock.content_by_name("se-va.txt").as_deref(),
+        Some(&b"adios"[..])
+    );
+}
+
+#[test]
+fn no_borra_en_drive_lo_que_nunca_se_sincronizo() {
+    let mock = MockDrive::start();
+    let work = tempfile::tempdir().unwrap();
+    let config = config_path(work.path());
+    let local = work.path().join("local");
+    fs::create_dir_all(&local).unwrap();
+    fs::write(local.join("propio.txt"), b"mio").unwrap();
+    let target = mock.add_folder("Ajeno", "root");
+    mock.add_file("de-otro.txt", &target, b"no tocar");
+
+    let output = run_cli(
+        mock.base(),
+        &config,
+        &[
+            "sync",
+            local.to_str().unwrap(),
+            "--remote",
+            "Ajeno",
+            "--direction",
+            "push",
+        ],
+    );
+    assert_ok(&output);
+    assert!(!mock.is_trashed("de-otro.txt"));
+    assert_eq!(
+        mock.content_by_name("de-otro.txt").as_deref(),
+        Some(&b"no tocar"[..])
+    );
+}
+
+#[test]
 fn respeta_exclusiones_en_ambos_lados() {
     let mock = MockDrive::start();
     let work = tempfile::tempdir().unwrap();
